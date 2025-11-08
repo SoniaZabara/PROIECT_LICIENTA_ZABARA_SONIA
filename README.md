@@ -4,8 +4,8 @@ Convertire G-Code in HP-GL
 
 Bibliografie:
 
-Utilizam https://github.com/FabriceSalvaire/pythonic-gcode-machine
+Utilizam pygcode
 
 Setup:
 
- pip install git+https://github.com/FabriceSalvaire/pythonic-gcode-machine
+ pip install pygcode
