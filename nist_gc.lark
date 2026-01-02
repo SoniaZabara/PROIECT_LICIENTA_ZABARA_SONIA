@@ -1,0 +1,116 @@
+//Grammar for NIST RS274NGC
+
+//Every line can also be called a block (in documentation)
+//A word consists of a letter followed by a number (or something that evaluates to a number)
+//A typical line of code consists of an optional line number at the beginning followed by one or more “words.”
+
+//modified to also accept % may remove later
+?start: maybe_start_percent body maybe_end_percent
+
+maybe_start_percent: percent_line?
+maybe_end_percent: percent_line?
+percent_line: /[ \t]*%[ \t]*\r?\n/
+body: line*
+
+arc_tangent_combo: arc_tangent expression divided_by expression
+binary_operation: binary_operation1
+                | binary_operation2
+                | binary_operation3
+binary_operation1: power
+binary_operation2: divided_by
+                 | modulo
+                 | times
+binary_operation3: and
+                 | exclusive_or
+                 | minus
+                 | non_exclusive_or
+                 | plus
+expression: "[" real_value ( binary_operation real_value )* "]"
+line: block_delete? line_number? segment* end_of_line
+line_number: ("n" | "N") digit digit? digit? digit? digit?
+mid_line_word: mid_line_letter real_value
+ordinary_unary_combo: ordinary_unary_operation expression
+ordinary_unary_operation: absolute_value
+                        | arc_cosine
+                        | arc_sine
+                        | cosine
+                        | e_raised_to
+                        | fix_down
+                        | fix_up
+                        | natural_log_of
+                        | round
+                        | sine
+                        | square_root
+                        | tangent
+parameter_index: real_value
+parameter_setting: parameter_sign parameter_index equal_sign real_value
+parameter_value: parameter_sign parameter_index
+real_value: real_number
+          | expression
+          | parameter_value
+          | unary_combo
+segment: mid_line_word
+       | comment
+       | parameter_setting
+unary_combo: ordinary_unary_combo
+           | arc_tangent_combo
+
+
+
+// terminal atoms
+
+absolute_value: /abs/i      //i is flag for case insensitive
+and: /and/i                 -> and_op   //for avoiding python name conflicts
+arc_cosine: /acos/i
+arc_sine: /asin/i
+arc_tangent: /atan/i
+block_delete: "/"
+comment: /\([^)]*\)/        //anything with: "(" content ")"
+cosine: /cos/i
+decimal_point: "."
+digit: /[0-9]/
+divided_by: "/"
+equal_sign: "="
+exclusive_or: /xor/i
+e_raised_to: /exp/i
+end_of_line: /[\n\r\u0085\u000B\u000C\u2028\u2029]/    //unicode newline characters + whitespace
+fix_down: /fix/i
+fix_up: /fup/i
+letter_a: /[Aa]/
+letter_b: /[Bb]/
+letter_c: /[Cc]/
+letter_d: /[Dc]/
+letter_f: /[Ff]/
+letter_g: /[Gg]/
+letter_h: /[Hh]/
+letter_i: /[Ii]/
+letter_j: /[Jj]/
+letter_k: /[Kk]/
+letter_l: /[Ll]/
+letter_m: /[Mm]/
+letter_n: /[Nn]/
+letter_p: /[Pp]/
+letter_q: /[Qq]/
+letter_r: /[Rr]/
+letter_s: /[Ss]/
+letter_t: /[Tt]/
+letter_x: /[Xx]/
+letter_y: /[Yy]/
+letter_z: /[Zz]/
+minus: "-"
+mid_line_letter: letter_a | letter_b | letter_c| letter_d | letter_f | letter_g | letter_h | letter_i | letter_j | letter_k | letter_l | letter_m | letter_p | letter_q | letter_r | letter_s | letter_t | letter_x | letter_y | letter_z
+modulo: /mod/i
+natural_log_of: /ln/i
+non_exclusive_or: /or/i
+parameter_sign: "#"
+plus: "+"
+power: "**"
+real_number: /[+-]?((\d+(\.\d*)?)|(\.\d+))/
+round: /round/i
+sine: /sin/i
+square_root: /sqrt/i
+tangent: /tan/i
+times: "*"
+
+
+%ignore " "
