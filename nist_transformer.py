@@ -1,21 +1,18 @@
 from lark import Transformer, Token, v_args
-from dataclasses import dataclass
-from typing import List, Union, Optional
+from dataclasses import dataclass, field
+from typing import Union
 
 # AST node classes
 
 @dataclass
 class Program:
-    maybe_start_percent: Optional[str]
-    body: List['Line']
-    maybe_end_percent: Optional[str]
+    lines: list["Line"]
 
 @dataclass
 class Line:
-    block_delete: Optional[str]
-    line_number: Optional[str]
-    segments: List[Union['MidLineWord', 'Comment', 'ParameterSet']]
-    end_of_line: str
+    block_delete: bool = False
+    line_number: int | None = None
+    segments: list["Segment"] = field(default_factory=list)
 
 @dataclass
 class BinaryOp:
@@ -34,70 +31,59 @@ class MidLineWord:
     real_value: 'Expression'
 
 @dataclass
-class ParameterRef:
-    value: 'Expression'
+class ParameterRef: # parameter reference (parameter_index) ex: L#100
+    index: 'Expression'
 
 @dataclass
-class ParameterSet:
+class ParameterSet: # parameter setting ex: #1 = 10
     index: 'Expression'
     value: 'Expression'
 
 @dataclass
 class Comment:
     text: str
+    is_message: bool    # not sure about this one
 
 @dataclass
 class RealNumber:
     value: float
 
 Expression = Union[RealNumber, ParameterRef, UnaryOp, BinaryOp]
+Segment = Union[MidLineWord, ParameterSet, Comment]
 
 # converts lark parse tree into python structures (basically strings and numbers)
 @v_args(inline=True)
 class NistTransformer(Transformer):
-    def start(self, maybe_start_percent, body, maybe_end_percent):
-        start = maybe_start_percent if maybe_start_percent else None
-        end = maybe_end_percent if maybe_end_percent else None
-        lines = body if isinstance(body, list) else [body] if body is not None else []
-        return Program(start, lines, end)
-
-    def maybe_start_percent(self, item = None):
-        return item
-
-    def maybe_end_percent(self, item = None):
-        return item
+    def start(self, body):
+        return Program(body)
 
     def body(self, *lines):
         return list(lines)
 
     def line(self, *items):
-        block_delete = None
+        block_delete = False
         line_number = None
         segments = []
-        end_of_line = None
+
         for item in items:
-            if isinstance(item, str) and item.strip() == "/":
-                block_delete = item
-                continue
+            if item == "/":
+                block_delete = True
 
-            if isinstance(item, str) and any(ch in item for ch in "\r\n"):
-                end_of_line = item
-                continue
-
-            if isinstance(item, int):
+            elif isinstance(item, int):
                 line_number = item
-                continue
 
-            if isinstance(item,(MidLineWord, Comment, ParameterSet)):
+            elif isinstance(item,(MidLineWord, Comment, ParameterSet)):
                 segments.append(item)
-                continue
 
-        return Line(block_delete, line_number, segments, end_of_line)
+            else:
+                # ignore end_of_line tokens
+                pass
 
-    def arc_tangent_combo(self, arc_tangent, expression_1, divided_by, expression_2):
-        atan_name = str(arc_tangent)
-        left = UnaryOp(atan_name, expression_1)
-        return BinaryOp("/", left, expression_2)
+        return Line(block_delete, line_number, segments)
+
+    def arc_tangent_combo(self, _arc_tangent, expression_1, _divided_by, expression_2):
+        # atan[expr1]/[expr2]
+        return BinaryOp("/", UnaryOp("atan", expression_1), expression_2)
 
     def binary_operation(self, item):
         return item
@@ -113,44 +99,56 @@ class NistTransformer(Transformer):
 
     def expression(self, first, *rest):
         node = first
-        it = iter(rest)
-        for op, val in zip(it, it):
-            op_str = str(op)
-            node = BinaryOp(op_str, node, val)
+        items = list(rest)
+
+        for i in range(0, len(items), 2):
+            op = items[i]
+            right = items[i+1]
+            node = BinaryOp(str(op).lower(), node, right)
+
         return node
 
 
     def line_number(self, *items):
         # return only the value without "n"/"N"
-        s = ''.join(str(x) for x in items if str(x).isdigit())
-        if s == "":
-            return None
-        try:
-            return int(s)
-        except ValueError:
-            return None
-
+        digits = "".join(str(x) for x in items if str(x).isdigit())
+        return int(digits)
 
     def mid_line_word(self, mid_line_letter, real_value):
-        return MidLineWord(mid_line_letter, real_value)
+        return MidLineWord(str(mid_line_letter).upper(), real_value)
+
+    def mid_line_letter(self, item):
+        return str(item).upper()
 
     def ordinary_unary_combo(self, op, expr):
-        return UnaryOp(str(op), expr)
+        return UnaryOp(str(op).lower(), expr)
 
     def ordinary_unary_operation(self, item):
-        return item
+        return str(item).lower()
 
     def parameter_index(self, item):
         return item
 
-    def parameter_setting(self, parameter_sign, parameter_index, equal_sign, real_value):
-        return ParameterSet(parameter_index, real_value)
+    def parameter_setting(self, _parameter_sign, parameter_index, _equal_sign, real_value): # the parameters not used are there for the transformer to work correctly
+        return ParameterSet(index=parameter_index, value=real_value)
 
-    def parameter_value(self, parameter_sign, parameter_index):
-        return ParameterRef(parameter_index)
+    def parameter_value(self, _parameter_sign, parameter_index):
+        return ParameterRef(index=parameter_index)
+
+    def real_number(self, token: Token):
+        return RealNumber(float(token))
 
     def real_value(self, item):
         return item
+
+    def comment(self, token: Token):
+        raw_text = str(token)
+        text = raw_text[1:-1]
+
+        stripped = text.lstrip()
+        is_message = stripped.upper().startswith("MSG,")
+
+        return Comment(text=text, is_message=is_message)
 
     def segment(self, item):
         return item
@@ -160,59 +158,55 @@ class NistTransformer(Transformer):
 
 
     # all terminal expressions basically
-    def percent_line(self, token: Token): return str(token)
-    def absolute_value(self, token: Token): return str(token)
-    def and_op(self): return "and"
-    def arc_cosine(self, token: Token): return str(token)
-    def arc_sine(self, token: Token): return str(token)
-    def arc_tangent(self, token: Token): return str(token)
-    def block_delete(self): return "/"
-    def comment(self, token: Token): return Comment(str(token))
-    def cosine(self, token: Token): return str(token)
-    def decimal_point(self, token: Token): return str(token)
-    def digit(self, token: Token): return str(token)
-    def divided_by(self): return "/"
-    def equal_sign(self): return "="
-    def exclusive_or(self): return "xor"
-    def e_raised_to(self, token: Token): return str(token)
-    def end_of_line(self, token: Token): return str(token)
-    def fix_down(self, token: Token): return str(token)
-    def fix_up(self, token: Token): return str(token)
+    def absolute_value(self, t): return str(t)
+    def and_op(self, *_): return "and"
+    def arc_cosine(self, t): return str(t)
+    def arc_sine(self, t): return str(t)
+    def arc_tangent(self, t): return str(t)
+    def block_delete(self, *_): return "/"
+    def cosine(self, t): return str(t)
+    #def decimal_point(self): return "." # not used anymore, already covered in grammar for real number without needing separate entity
+    def digit(self, t): return str(t)
+    def divided_by(self, *_): return "/"
+    def equal_sign(self, *_): return "="
+    def exclusive_or(self, *_): return "xor"
+    def e_raised_to(self, t): return str(t)
+    def end_of_line(self, *_): return None  # * -> accepts any number of extra positional arguments, _ means unused
+    def fix_down(self, t): return str(t)
+    def fix_up(self, t): return str(t)
 
-    def letter_a(self, token: Token): return str(token)
-    def letter_b(self, token: Token): return str(token)
-    def letter_c(self, token: Token): return str(token)
-    def letter_d(self, token: Token): return str(token)
-    def letter_f(self, token: Token): return str(token)
-    def letter_g(self, token: Token): return str(token)
-    def letter_h(self, token: Token): return str(token)
-    def letter_i(self, token: Token): return str(token)
-    def letter_j(self, token: Token): return str(token)
-    def letter_k(self, token: Token): return str(token)
-    def letter_l(self, token: Token): return str(token)
-    def letter_m(self, token: Token): return str(token)
-    def letter_n(self, token: Token): return str(token)
-    def letter_p(self, token: Token): return str(token)
-    def letter_q(self, token: Token): return str(token)
-    def letter_r(self, token: Token): return str(token)
-    def letter_s(self, token: Token): return str(token)
-    def letter_t(self, token: Token): return str(token)
-    def letter_x(self, token: Token): return str(token)
-    def letter_y(self, token: Token): return str(token)
-    def letter_z(self, token: Token): return str(token)
+    def letter_a(self, t): return str(t)
+    def letter_b(self, t): return str(t)
+    def letter_c(self, t): return str(t)
+    def letter_d(self, t): return str(t)
+    def letter_f(self, t): return str(t)
+    def letter_g(self, t): return str(t)
+    def letter_h(self, t): return str(t)
+    def letter_i(self, t): return str(t)
+    def letter_j(self, t): return str(t)
+    def letter_k(self, t): return str(t)
+    def letter_l(self, t): return str(t)
+    def letter_m(self, t): return str(t)
+    def letter_n(self, t): return str(t)
+    def letter_p(self, t): return str(t)
+    def letter_q(self, t): return str(t)
+    def letter_r(self, t): return str(t)
+    def letter_s(self, t): return str(t)
+    def letter_t(self, t): return str(t)
+    def letter_x(self, t): return str(t)
+    def letter_y(self, t): return str(t)
+    def letter_z(self, t): return str(t)
 
-    def minus(self): return "-"
-    def mid_line_letter(self, token: Token): return str(token)
-    def modulo(self): return "mod"
-    def natural_log_of(self, token: Token): return str(token)
-    def non_exclusive_or(self): return "or"
-    def parameter_sign(self): return "#"
-    def plus(self): return "+"
-    def power(self): return "**"
-    def real_number(self, token: Token): return float(str(token))
-    def round(self, token: Token): return str(token)
-    def sine(self, token: Token): return str(token)
-    def square_root(self, token: Token): return str(token)
-    def tangent(self, token: Token): return str(token)
-    def times(self): return "*"
+    def minus(self, *_): return "-"
+    def modulo(self, *_): return "mod"
+    def natural_log_of(self, t): return str(t)
+    def non_exclusive_or(self, *_): return "or"
+    def parameter_sign(self, *_): return "#"
+    def plus(self, *_): return "+"
+    def power(self, *_): return "**"
+    def round(self, t): return str(t)
+    def sine(self, t): return str(t)
+    def square_root(self, t): return str(t)
+    def tangent(self, t): return str(t)
+    def times(self, *_): return "*"
 

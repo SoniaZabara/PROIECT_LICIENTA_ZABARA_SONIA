@@ -1,66 +1,77 @@
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Any
-import math
+from typing import Optional, Any
+
+from nist_transformer import (
+    Program,
+    Line,
+    MidLineWord,
+    ParameterSet,
+    Comment,
+)
+
+from expression_evaluator import ExpressionEvaluator
 
 # IR (Intermediate Representation) dataclasses
 @dataclass
 class RapidMove:
-    x: Optional[float]
-    y: Optional[float]
-    z: Optional[float]
-    def __repr__(self):
-        return f"RapidMove(x={self.x}, y={self.y}, z={self.z})"
+    x: float
+    y: float
+    z: float
+
 
 @dataclass
 class LinearMove:
-    x: Optional[float]
-    y: Optional[float]
-    z: Optional[float]
+    x: float
+    y: float
+    z: float
     feed: Optional[float]
-    def __repr__(self):
-        return f"LinearMove(x={self.x}, y={self.y}, z={self.z}, feed={self.feed})"
 
 @dataclass
 class ArcMove:
-    cw: bool    #clockwise True = G2, False = G3
-    x: Optional[float]
-    y: Optional[float]
-    i: Optional[float]
-    j: Optional[float]
-    def __repr__(self):
-        d = "CW" if self.cw else "CCW"
-        return f"ArcMove({d}, x={self.x}, y={self.y}), i={self.i}, j={self.j})"
+    clockwise: bool    #clockwise True = G2, False = G3
+    x: float
+    y: float
+    z: float
+    i: Optional[float] = None
+    j: Optional[float] = None
+    r: Optional[float] = None
 
 @dataclass
 class SetFeed:
     feed: float
-    def __repr__(self):
-        return f"SetFeed(feed={self.feed})"
 
 @dataclass
 class SetUnits:
     units: str
-    def __repr__(self):
-        return f"SetUnits(units={self.units})"
 
 @dataclass
 class SetTool:
     tool: int
-    def __repr__(self):
-        return f"SetTool(tool={self.tool})"
+
+@dataclass
+class SpindleOn:
+    clockwise: bool = True
+
+@dataclass
+class SpindleOff:
+    pass
 
 @dataclass
 class ProgramEnd:
-    def __repr__(self):
-        return "ProgramEnd()"
+    pass
+
+@dataclass
+class CommentIR:
+    text: str
+    is_message: bool = False
 
 # Interpreter
 class NistInterpreter:
     def __init__(self):
-        # machine state - may make a different class later
         self.units = 'mm'           # 'mm' or 'inch' (G21/G20)
         self.absolute = True        # True = G90, False = G91
         self.motion_mode = 'G0'     # G0, G1, G2, G3,
+
         self.feed: Optional[float] = None
         self.tool: Optional[int] = None
         # see modal groups for whole possibilities
@@ -70,339 +81,247 @@ class NistInterpreter:
         self.y = 0.0
         self.z = 0.0
 
-        # parameter table 5400 values?? not sure where useful, should keep values between uses
-        self.params: Dict[int, float] = {}
+        self.params: dict[int, float] = {}
+        self.expr = ExpressionEvaluator(self.params)
 
         # modal group mapping
         # self.modal_groups = {}
 
+        self.ended = False
+
     # accept Program AST -> list of IR
-    def interpret(self, program) -> List[Any]:
-        out: List[Any] = []
+    def interpret(self, program: Program) -> list[Any]:
+        output : list[Any] = []
+
         if program is None:
-            return out
-        for line in getattr(program, "body", []) or []:
-            try:
-                # if line.block_delete != "/":    #ignore deleted lines
-                # out.extend(self._interpret_line(line))
-                out.extend(self._interpret_line(line) or [])
-            except Exception as e:
-                print(f"[Interpreter] Error interpreting line {line}: {e}")
-        return out
+            return output
+
+        for line in program.lines:
+            if self.ended:
+                break
+
+            output.extend(self._interpret_line(line))
+
+        return output
 
     # interpret a single Line AST (_ because is internal)
-    def _interpret_line(self, line) -> List:
-        ir: List[Any] = []
+    def _interpret_line(self, line) -> list[Any]:
+        ir: list[Any] = []
 
-        if line is None:
+        if line.block_delete:
+            # skip block-delete lines for now, might handle differently later
             return ir
 
-        # process parameter
-        for seg in line.segments:
-            if self._is_instance_name(seg, "ParameterSet"):
-                try:
-                    self._apply_param_set(seg)
-                except Exception as e:
-                    print(f"[Interpreter] Parameter set error: {e}")
+        words_list, comments, pending_parameter_sets = self._read_line(line)
 
-        words: Dict[str, Any] = {}
-        for seg in line.segments:
-            # comments I might skipp
-            if self._is_instance_name(seg, 'Comment'):
-                ir.append(getattr(seg, "text", None))
-                continue
+        words = self._group_words(words_list)
 
-            if self._is_instance_name(seg, 'MidLineWord'):
-                letter = getattr(seg, "mid_line_letter", None)
-                if letter is None:
-                    continue
-                letter = str(letter).strip().upper()
-                # real_value could be RealNumber, BinaryOp, etc
-                words[letter] = getattr(seg, "real_value", None)
-                continue
+        for comment in comments:
+            ir.append(CommentIR(comment.text, comment.is_message))
 
+        self._handle_non_motion_words(words, ir)
+        self._handle_motion(words, ir)
 
-        # handle G, M, F, S, T
-        if 'G' in words:
-            gval = self._eval_expr(words['G'])
-            self._handle_g_code(gval, ir)
-
-        if 'M' in words:
-            mval = self._eval_expr(words['M'])
-            self._handle_m_code(mval, ir)
-
-        if 'F' in words:
-            fval = self._eval_expr(words['F'])
-            if fval is not None:
-                self.feed = fval
-                ir.append(SetFeed(self.feed))
-
-        if 'S' in words:
-            sval = words['S']
-            # create and append SetSpindle if needed in the future
-
-        if 'T' in words:
-            tval = words['T']
-            if tval is not None:
-                self.tool = int(round(tval))
-                ir.append(SetTool(self.tool))
-
-        # extract coordinates
-        coords: Dict[str, Optional[float]] = {}
-        for axis in ('X', 'Y', 'Z', 'I', 'J', 'R'): #XY plane
-            if axis in words:
-                coords[axis] = self._eval_expr(words.get(axis))
-            else:
-                coords[axis] = None
-
-        # convert units, convert inch into mm internally
-        if self.units == 'inch':
-            for a in ('X', 'Y', 'Z', 'I', 'J', 'R'):
-                if coords[a] is not None:
-                    coords[a] = coords[a] * 25.4
-
-        # resolve target position according to absolute/relative
-        #target = {'X': self.x, 'Y': self.y, 'Z': self.z}
-        target = {'X': 0.0, 'Y': 0.0, 'Z': self.z}
-        if coords['X'] is not None:
-            target['X'] = coords['X'] if self.absolute else (self.x + coords['X'])
-        if coords['Y'] is not None:
-            target['Y'] = coords['Y'] if self.absolute else (self.y + coords['Y'])
-        if coords['Z'] is not None:
-            target['Z'] = coords['Z'] if self.absolute else (self.z + coords['Z'])
-
-        # emit motion IR according to motion_mode
-        if self.motion_mode == 'G0':
-            # Rapid move: only emit if any axis changed
-            if(target['X'], target['Y'], target['Z']) != (self.x, self.y, self.z):
-                ir.append(RapidMove(target['X'], target['Y'], target['Z']))
-                # update
-                self.x, self.y, self.z = target['X'], target['Y'], target['Z']
-        elif self.motion_mode == 'G1':
-            if (target['X'], target['Y'], target['Z']) != (self.x, self.y, self.z):
-                ir.append(LinearMove(target['X'], target['Y'], target['Z'], self.feed))
-                # update
-                self.x, self.y, self.z = target['X'], target['Y'], target['Z']
-        elif self.motion_mode == 'G2':
-            # for arcs I/J
-            # R not implemented
-            i = coords.get('I')
-            j = coords.get('J')
-            r = coords.get('R')
-            cw = (self.motion_mode == 'G2')
-
-            if(target['X'] is None) and (target['Y'] is None):
-                # nothing to do for arc if endpoint missing
-                pass
-            # use I/J if present
-            else:
-                if i is not None or j is not None:
-                    ir.append(ArcMove(cw, target['X'], target['Y'], i, j))
-                    # update position
-                    if target['X'] is not None: self.x = target['X']
-                    if target['Y'] is not None: self.x = target['Y']
-                elif r is not None:
-                    # not implemented only approximated
-                    ir.append(ArcMove(cw, target['X'], target['Y'], None, None))
-                    if target['X'] is not None: self.x = target['X']
-                    if target['Y'] is not None: self.x = target['Y']
-                # else: non motion line TBD
+        # parameter buffering
+        # parameters take effect after all values on same line have been evaluated.
+        for index, value in pending_parameter_sets:
+            self.params[index] = value
 
         return ir
 
-    # put parameters found in params
-    def _apply_param_set(self, paramset):
-        if paramset is None:
-            return
-        idx_expr = getattr(paramset, "index", None)
-        val_expr = getattr(paramset, "value", None)
-        idx_raw = self._eval_expr(idx_expr)
-        if idx_raw is None:
-            return
-        try:
-            idx = int(round(idx_raw))
-        except Exception:
-            return
-        val = self._eval_expr(val_expr)
-        self.params[idx] = val if val is not None else 0.0
+    def _read_line(self, line: Line):
+        words_list: list[tuple[str, float]] = []
+        comments: list[Comment] = []
+        pending_parameter_sets: list[tuple[int, float]] = []
+
+        for segment in line.segments:
+            if isinstance(segment, MidLineWord):
+                letter = segment.mid_line_letter.upper()
+                value = self.expr.eval(segment.real_value)
+                words_list.append((letter, value))
+
+            elif isinstance(segment, ParameterSet):
+                index = self.expr.eval_parameter_index(segment.index)
+                value = self.expr.eval(segment.value)
+                pending_parameter_sets.append((index, value))
+
+            elif isinstance(segment, Comment):
+                comments.append(segment)
+
+        return words_list, comments, pending_parameter_sets
+
+    def _group_words(self, words_list: list[tuple[str, float]]) -> dict[str, list[float]]:
+        grouped: dict[str, list[float]] = {}
+
+        for letter, value in words_list:
+            grouped.setdefault(letter, []).append(value)
+
+        return grouped
+
+    def _last_word(self, words: dict[str, list[float]], letter: str) -> Optional[float]:
+        values = words.get(letter.upper())
+        if not values:
+            return None
+        return values[-1]
+
+    def _handle_non_motion_words(self, words: dict[str, list[float]], ir:list[Any]) -> None:
+        # F
+        f = self._last_word(words, "F")
+        if f is not None:
+            self.feed = f
+            ir.append(SetFeed(f))
+
+        # S word ignored for now, later: SetSpindleSpeed
+
+        # T
+        t = self._last_word(words, "F")
+        if t is not None:
+            self.tool = self._to_int(t, "T")
+            ir.append(SetTool(self.tool))
+
+        # G
+        for g in words.get("G", []):
+            self._handle_g_code(g, ir)
+
+        for m in words.get("M", []):
+            self._handle_m_code(m, ir)
 
     # handle G code that change modal state
-    def _handle_g_code(self, gval, ir):
-        if gval is None:
-            return
-        try:
-            gnum = int(round(gval)) ##BEVARE THERE IS ALSO G38.2 this doesnt APPLY!!!!
-        except Exception:
-            return
-        if gnum == 20:
-            self.units = 'inch'
-            ir.append(SetUnits('inch'))
-        elif gnum == 21:
-            self.units = 'mm'
-            ir.append(SetUnits('mm'))
-        elif gnum == 90:
+    def _handle_g_code(self, gval: float, ir: list[Any]) -> None:
+        g = self._normalize_code(gval)
+
+        if g == "G0":
+            self.motion_mode = "G0"
+        elif g == "G1":
+            self.motion_mode = "G1"
+        elif g == "G2":
+            self.motion_mode = "G2"
+        elif g == "G3":
+            self.motion_mode = "G3"
+
+        elif g == "G20":
+            self.units = "inch"
+            ir.append(SetUnits("inch"))
+        elif g == "G21":
+            self.units = "mm"
+            ir.append(SetUnits("mm"))
+
+        elif g == "G90":
             self.absolute = True
-        elif gnum == 91:
+        elif g == "G91":
             self.absolute = False
-        elif gnum in (0, 1, 2, 3):
-            self.motion_mode = f'G{gnum}'
+
+        elif g == "G80":
+            self.motion_mode = "G80"
+
         # else ignore other G codes for now
 
     def _handle_m_code(self, mval, ir):
-        if mval is None:
-            return
-        try:
-            mnum = int(round(mval)) # not correct ???
-        except Exception:
-            return
-        # M codes
-        if mnum == 3:
+        m = self._to_int(mval, "M")
+
+        if m == 3:
             # spindle on
-            pass
-        elif mnum == 5:
+            ir.append(SpindleOn(clockwise=True))
+        elif m == 4:
+            ir.append(SpindleOn(clockwise=False))
+        elif m == 5:
             # spindle off
-            pass
-        elif mnum in (2, 30):
+            ir.append(SpindleOff())
+        elif m in (2, 30):
             ir.append(ProgramEnd())
+            self.ended = True
 
-    # Expression evaluator
-    def _eval_expr(self, expr) -> Optional[float]:
-        if expr is None:
-            return None
+    def _handle_motion(self, words: dict[str, list[float]], ir: list[Any]) -> None:
+        coords = self._read_coords(words)
 
-        if isinstance(expr, (int, float)):
-            return float(expr)
+        has_axis_motion = any(coords[a] is not None for a in ("X", "Y", "Z"))
 
-        if isinstance(expr, tuple) and len(expr) >= 2:
-            tag = expr[0]
-            if tag == 'RealNumber':
-                try:
-                    return float(expr[1])
-                except Exception:
-                    return None
-            if tag == 'ParameterRef' and len(expr) >= 2:
-                return self._eval_expr(expr[1])
+        if not has_axis_motion:
+            return
 
-        # from here chatgpt!!! to end of function cuz I really don't know why it didn't work the way I implemented it
+        target_x = self.x
+        target_y = self.y
+        target_z = self.z
 
-        # try to detect by attribute names (works for your dataclasses)
-        # RealNumber -> .value
-        if hasattr(expr, "value") and not hasattr(expr, "left") and not hasattr(expr, "arg"):
-            # ParameterSet/ParameterRef/RealNumber share .value in different contexts.
-            # Disambiguate: if value is numeric, treat as RealNumber-like; if value is expr and this object type is ParameterRef, treat accordingly.
-            # If object also has a field that suggests parameter-ref, handle below.
-            try:
-                # if .value is basic numeric -> return it (RealNumber)
-                if isinstance(expr.value, (int, float)):
-                    return float(expr.value)
-            except Exception:
-                pass
+        if coords["X"] is not None:
+            target_x = coords["X"] if self.absolute else self.x + coords["X"]
 
-        # ParameterRef (many variants: .value, .index, .index_expr)
-        if self._is_instance_name(expr, "ParameterRef") or hasattr(expr, "index") or (
-                hasattr(expr, "value") and self._looks_like_paramref(expr)):
-            # index expression might be in .value or .index or .param_index or .index_expr
-            idx_expr = getattr(expr, "value", None) if self._is_instance_name(expr, "ParameterRef") else None
-            idx_expr = idx_expr or getattr(expr, "index", None) or getattr(expr, "index_expr", None) or getattr(
-                expr, "param_index", None)
-            idx_val = self._eval_expr(idx_expr)
-            if idx_val is None:
-                return 0.0
-            try:
-                idx = int(round(idx_val))
-            except Exception:
-                return 0.0
-            return float(self.params.get(idx, 0.0))
+        if coords["Y"] is not None:
+            target_y = coords["Y"] if self.absolute else self.y + coords["Y"]
 
-        # RealNumber dataclass with .value
-        if self._is_instance_name(expr, "RealNumber") or hasattr(expr, "value") and isinstance(
-                getattr(expr, "value", None), (int, float)):
-            try:
-                return float(getattr(expr, "value"))
-            except Exception:
-                return None
+        if coords["Z"] is not None:
+            target_z = coords["Z"] if self.absolute else self.z + coords["Z"]
 
-        # UnaryOp
-        if self._is_instance_name(expr, "UnaryOp") or hasattr(expr, "op") and hasattr(expr, "arg"):
-            arg_val = self._eval_expr(getattr(expr, "arg", None))
-            if arg_val is None:
-                return None
-            op = str(getattr(expr, "op", "")).upper()
-            # trig functions expect degrees
-            if op == 'SIN':
-                return math.sin(math.radians(arg_val))
-            if op == 'COS':
-                return math.cos(math.radians(arg_val))
-            if op == 'TAN':
-                return math.tan(math.radians(arg_val))
-            if op == 'ASIN':
-                return math.degrees(math.asin(self._clamp(arg_val, -1, 1)))
-            if op == 'ACOS':
-                return math.degrees(math.acos(self._clamp(arg_val, -1, 1)))
-            if op == 'ATAN':
-                return math.degrees(math.atan(arg_val))
-            if op == 'SQRT':
-                return math.sqrt(arg_val)
-            if op == 'EXP':
-                return math.exp(arg_val)
-            if op == 'LN':
-                return math.log(arg_val)
-            if op == 'ABS':
-                return abs(arg_val)
-            if op == 'FIX':
-                return math.floor(arg_val)
-            if op == 'FUP':
-                return math.ceil(arg_val)
-            if op == 'ROUND':
-                return round(arg_val)
-            # unknown unary -> passthrough
-            return arg_val
+        if self.motion_mode == "G0":
+            ir.append(RapidMove(target_x, target_y, target_z))
+            self._set_position(target_x, target_y, target_z)
 
-        # BinaryOp
-        if self._is_instance_name(expr, "BinaryOp") or (
-                hasattr(expr, "left") and hasattr(expr, "right") and hasattr(expr, "op")):
-            left = self._eval_expr(getattr(expr, "left", None))
-            right = self._eval_expr(getattr(expr, "right", None))
-            if left is None or right is None:
-                return None
-            op = str(getattr(expr, "op", "")).lower()
-            if op == '+':
-                return left + right
-            if op == '-':
-                return left - right
-            if op == '*':
-                return left * right
-            if op == '/':
-                return left / right
-            if op == 'mod':
-                return left % right
-            if op == 'and':
-                return 1.0 if (left != 0 and right != 0) else 0.0
-            if op == 'or':
-                return 1.0 if (left != 0 or right != 0) else 0.0
-            if op == 'xor':
-                return 1.0 if ((left != 0) ^ (right != 0)) else 0.0
-            # fallback unknown operator
-            return None
+        elif self.motion_mode == "G1":
+            ir.append(LinearMove(target_x, target_y, target_z, self.feed))
+            self._set_position(target_x, target_y, target_z)
 
-        # fallback: unknown shape -> None
-        return None
+        elif self.motion_mode == ("G2", "G3"):
+            clockwise = self.motion_mode == "G2"
 
-    def _clamp(self, v, a, b):
-        return max(a, min(b, v))
+            i = coords["I"]
+            j = coords["J"]
+            r = coords["R"]
 
-    def _is_instance_name(self, obj, name: str) -> bool:
-        # Return True if obj is instance and its class name matches name
-        try:
-            return obj is not None and obj.__class__.__name__ == name
-        except Exception:
-            return False
+            if i is None and j is None and r is None:
+                raise RuntimeError("Arc move requires I/J or R")
 
-    def _looks_like_paramref(self, obj) -> bool:
-        try:
-            if hasattr(obj, "value") and not isinstance(getattr(obj, "value"), (int, float)):
-                if obj.__class__.__name__ == "RealNumber":
-                    return True
-        except Exception:
-            pass
-        return False
+            ir.append(
+                ArcMove(
+                    clockwise=clockwise,
+                    x=target_x,
+                    y=target_y,
+                    z=target_z,
+                    i=i,
+                    j=j,
+                    r=r,
+                )
+            )
+
+            self._set_position(target_x, target_y, target_z)
+
+        elif self.motion_mode == "G80":
+            raise RuntimeError("Axis words are not allowed while G80 is active")
+
+    def _read_coords(self, words: dict[str, list[float]]) -> dict[str, Optional[float]]:
+        coords: dict[str, Optional[float]] = {}
+
+        for letter in ("X", "Y", "Z", "I", "J", "K", "R"):
+            value = self._last_word(words, letter)
+
+            if value is not None and self.units == "inch":
+                value *= 25.4
+
+            coords[letter] = value
+
+        return coords
+
+    def _set_position(self, x: float, y: float, z: float) -> None:
+        self.x = x
+        self.y = y
+        self.z = z
+
+    def _to_int(self, value: float, name: str) -> int:
+        rounded = round(value)
+
+        if abs(value - rounded) > 0.0001:
+            raise RuntimeError(f"{name} value must be close to integer, got {value}")
+
+        return int(rounded)
+
+    def _normalize_code(self, value: float) -> str:
+        """
+        Converts:
+        0 -> G0
+        1 -> G1
+        38.2 -> G38.2
+        59.3 -> G59.3
+        """
+        if abs(value - round(value)) <= 0.0001:
+            return f"G{int(round(value))}"
+
+        return f"G{value:g}"
