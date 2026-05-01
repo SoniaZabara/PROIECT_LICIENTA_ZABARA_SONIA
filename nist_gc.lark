@@ -1,15 +1,12 @@
 //Grammar for NIST RS274NGC
 
+//Grammars in Lark are based on EBNF syntax!!!
+
 //Every line can also be called a block (in documentation)
 //A word consists of a letter followed by a number (or something that evaluates to a number)
 //A typical line of code consists of an optional line number at the beginning followed by one or more “words.”
 
-//modified to also accept % may remove later
-?start: maybe_start_percent body maybe_end_percent
-
-maybe_start_percent: percent_line?
-maybe_end_percent: percent_line?
-percent_line: /[ \t]*%[ \t]*\r?\n/
+?start: body
 body: line*
 
 arc_tangent_combo: arc_tangent expression divided_by expression
@@ -28,6 +25,7 @@ binary_operation3: and
 expression: "[" real_value ( binary_operation real_value )* "]"
 line: block_delete? line_number? segment* end_of_line
 line_number: ("n" | "N") digit digit? digit? digit? digit?
+mid_line_letter: letter_a | letter_b | letter_c| letter_d | letter_f | letter_g | letter_h | letter_i | letter_j | letter_k | letter_l | letter_m | letter_p | letter_q | letter_r | letter_s | letter_t | letter_x | letter_y | letter_z //e o u v w not included
 mid_line_word: mid_line_letter real_value
 ordinary_unary_combo: ordinary_unary_operation expression
 ordinary_unary_operation: absolute_value
@@ -98,7 +96,6 @@ letter_x: /[Xx]/
 letter_y: /[Yy]/
 letter_z: /[Zz]/
 minus: "-"
-mid_line_letter: letter_a | letter_b | letter_c| letter_d | letter_f | letter_g | letter_h | letter_i | letter_j | letter_k | letter_l | letter_m | letter_p | letter_q | letter_r | letter_s | letter_t | letter_x | letter_y | letter_z
 modulo: /mod/i
 natural_log_of: /ln/i
 non_exclusive_or: /or/i
