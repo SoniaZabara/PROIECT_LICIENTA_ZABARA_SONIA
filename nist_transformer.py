@@ -97,6 +97,19 @@ class NistTransformer(Transformer):
     def binary_operation3(self, item):
         return item
 
+    def _op_text(self, op):
+        if isinstance(op, Token):
+            return str(op).lower()
+
+        if isinstance(op, str):
+            return op.lower()
+
+        # Handles Lark Tree-like wrappers, just in case
+        if hasattr(op, "children") and op.children:
+            return str(op.children[0]).lower()
+
+        return str(op).lower()
+
     def expression(self, first, *rest):
         # NIST precedence order: power, multiplication/division/modulo, addition/subtraction/logical
         items = [first] + list(rest)
@@ -110,20 +123,20 @@ class NistTransformer(Transformer):
         for ops in precedence:
             i = 1
             while i < len(items) - 1:
-                op = str(items[i]).lower()
+                op = self._op_text(items[i])
+
                 if op in ops:
-                    left = items[i - 1]
-                    right = items[i + 1]
-                    node = BinaryOp(op, left, right)
-                    items[i -1:i + 1] = [node]
+                    items[i -1:i + 2] = [
+                        BinaryOp(op, items[i - 1], items[i + 1])
+                    ]
                     i = 1
                 else:
                     i += 2
 
-            if len(items) != 1:
-                raise RuntimeError(f"Could not reduce expression: {items}")
+        if len(items) != 1:
+            raise RuntimeError(f"Could not reduce expression: {items}")
 
-            return items[0]
+        return items[0]
 
 
     def line_number(self, *items):
