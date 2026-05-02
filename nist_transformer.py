@@ -83,7 +83,7 @@ class NistTransformer(Transformer):
 
     def arc_tangent_combo(self, _arc_tangent, expression_1, _divided_by, expression_2):
         # atan[expr1]/[expr2]
-        return BinaryOp("/", UnaryOp("atan", expression_1), expression_2)
+        return UnaryOp("atan", BinaryOp("/", expression_1, expression_2))
 
     def binary_operation(self, item):
         return item
@@ -98,15 +98,32 @@ class NistTransformer(Transformer):
         return item
 
     def expression(self, first, *rest):
-        node = first
-        items = list(rest)
+        # NIST precedence order: power, multiplication/division/modulo, addition/subtraction/logical
+        items = [first] + list(rest)
 
-        for i in range(0, len(items), 2):
-            op = items[i]
-            right = items[i+1]
-            node = BinaryOp(str(op).lower(), node, right)
+        precedence = [
+            {"**"},
+            {"*", "/", "mod"},
+            {"+", "-", "or", "xor", "and"}
+        ]
 
-        return node
+        for ops in precedence:
+            i = 1
+            while i < len(items) - 1:
+                op = str(items[i]).lower()
+                if op in ops:
+                    left = items[i - 1]
+                    right = items[i + 1]
+                    node = BinaryOp(op, left, right)
+                    items[i -1:i + 1] = [node]
+                    i = 1
+                else:
+                    i += 2
+
+            if len(items) != 1:
+                raise RuntimeError(f"Could not reduce expression: {items}")
+
+            return items[0]
 
 
     def line_number(self, *items):
