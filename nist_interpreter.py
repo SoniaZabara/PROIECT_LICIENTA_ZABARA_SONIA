@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Optional, Any
+import math
 
 from nist_transformer import (
     Program,
@@ -29,16 +30,27 @@ class LinearMove:
 @dataclass
 class ArcMove:
     clockwise: bool    #clockwise True = G2, False = G3
+    plane: str
     x: float
     y: float
     z: float
-    i: Optional[float] = None
-    j: Optional[float] = None
-    r: Optional[float] = None
+    center_x: float
+    center_y: float
+    center_z: float
+    rotation: int
+    feed: Optional[float]
+
+@dataclass
+class Dwell:
+    seconds: float
 
 @dataclass
 class SetFeed:
     feed: float
+
+@dataclass
+class SetSpindleSpeed:
+    speed: float
 
 @dataclass
 class SetUnits:
@@ -49,12 +61,32 @@ class SetTool:
     tool: int
 
 @dataclass
+class ChangeTool:
+    tool: int
+
+@dataclass
 class SpindleOn:
     clockwise: bool = True
 
 @dataclass
 class SpindleOff:
     pass
+
+@dataclass
+class CoolantMistOn:
+    pass
+
+@dataclass
+class CoolantFloodOn:
+    pass
+
+@dataclass
+class CoolantOff:
+    pass
+
+@dataclass
+class ProgramStop:
+    optional: bool = False
 
 @dataclass
 class ProgramEnd:
@@ -67,14 +99,45 @@ class CommentIR:
 
 # Interpreter
 class NistInterpreter:
-    def __init__(self):
-        self.units = 'mm'           # 'mm' or 'inch' (G21/G20)
-        self.absolute = True        # True = G90, False = G91
-        self.motion_mode = 'G0'     # G0, G1, G2, G3,
+    EPS = 1e-4 # 0.0001
+
+    G_GROUPS = {
+        # modal
+        1: {"G0", "G1", "G2", "G3", "G38.2", "G80", "G81", "G82", "G83", "G84", "G85", "G86", "G87", "G88", "G89"}, # motion
+        2: {"G17", "G18", "G19"}, # plane selection
+        3: {"G90", "G91"}, # distance mode
+        5: {"G93", "G94"}, # feed rate mode
+        6: {"G20", "G21"}, # units
+        7: {"G40", "G41", "G42"}, # cutter radius compensation
+        8: {"G43", "G49"}, # tool length offset
+        10: {"G98", "G99"}, # return mode in canned cycles
+        12: {"G54", "G55", "G56", "G57", "G58", "G59", "G59.1", "G59.2", "G59.3"}, # coordinate sistem selection
+        13: {"G61", "G61.1", "G64"}, # path control mode
+        # non-modal
+        0: {"G4", "G10", "G28", "G30", "G53", "G92", "G92.1", "G92.2", "G92.3"},
+    }
+
+    M_GROUPS = {
+        4: {0, 1, 2, 30, 60}, # stopping
+        6: {6}, # tool change
+        7: {3, 4, 5}, # spindle turning
+        8: {7, 8, 9}, # coolant (special case: M7 and M8 may be active at the same time)
+        9: {48, 49}, # enable/disable feed and speed override switches
+    }
+
+    def __init__(self, block_delete_enabled: bool = False):
+        self.block_delete_enabled = block_delete_enabled
+
+        self.units = "mm"           # 'mm' or 'inch' (G21/G20)
+        self.distance_mode = "absolute" # G90/G91
+        self.feed_mode = "units_per_min" # G94/G93
+        self.motion_mode = 'G1'     # G0, G1, G2, G3,
+        self.plane = "XY"   #G17
 
         self.feed: Optional[float] = None
-        self.tool: Optional[int] = None
-        # see modal groups for whole possibilities
+        self.spindle_speed: float = 0.0
+        self.selected_tool: int = 0
+        self.current_tool: int = 0
 
         #  machine position (current)
         self.x = 0.0
@@ -83,9 +146,6 @@ class NistInterpreter:
 
         self.params: dict[int, float] = {}
         self.expr = ExpressionEvaluator(self.params)
-
-        # modal group mapping
-        # self.modal_groups = {}
 
         self.ended = False
 
@@ -105,26 +165,38 @@ class NistInterpreter:
         return output
 
     # interpret a single Line AST (_ because is internal)
-    def _interpret_line(self, line) -> list[Any]:
+    def _interpret_line(self, line: Line) -> list[Any]:
+        if line.block_delete and self.block_delete_enabled:
+            return []
+
+        block = self._read_line(line)
+        self._validate_repeats(block)
+        self._validate_modal_groups(block)
+
         ir: list[Any] = []
 
-        if line.block_delete:
-            # skip block-delete lines for now, might handle differently later
-            return ir
+        if block["comments"]:
+            c = block["comments"][-1]
+            ir.append(CommentIR(c.text, c.is_message))
 
-        words_list, comments, pending_parameter_sets = self._read_line(line)
+        self._exec_feed_mode(block)
+        self._exec_feed(block, ir)
+        self._exec_spindle_speed(block, ir)
+        self._exec_select_tool(block, ir)
+        self._exec_tool_change(block, ir)
+        self._exec_spindle(block, ir)
+        self._exec_coolant(block, ir)
+        self._exec_dwell(block, ir)
+        self._exec_plane(block)
+        self._exec_units(block, ir)
+        self._exec_distance_mode(block)
 
-        words = self._group_words(words_list)
-
-        for comment in comments:
-            ir.append(CommentIR(comment.text, comment.is_message))
-
-        self._handle_non_motion_words(words, ir)
-        self._handle_motion(words, ir)
+        self._exec_motion(block, ir)
+        self._exec_stopping(block, ir)
 
         # parameter buffering
         # parameters take effect after all values on same line have been evaluated.
-        for index, value in pending_parameter_sets:
+        for index, value in block["param_sets"]:
             self.params[index] = value
 
         return ir
@@ -132,7 +204,7 @@ class NistInterpreter:
     def _read_line(self, line: Line):
         words_list: list[tuple[str, float]] = []
         comments: list[Comment] = []
-        pending_parameter_sets: list[tuple[int, float]] = []
+        param_sets: list[tuple[int, float]] = []
 
         for segment in line.segments:
             if isinstance(segment, MidLineWord):
@@ -143,172 +215,336 @@ class NistInterpreter:
             elif isinstance(segment, ParameterSet):
                 index = self.expr.eval_parameter_index(segment.index)
                 value = self.expr.eval(segment.value)
-                pending_parameter_sets.append((index, value))
+                param_sets.append((index, value))
 
             elif isinstance(segment, Comment):
                 comments.append(segment)
 
-        return words_list, comments, pending_parameter_sets
-
-    def _group_words(self, words_list: list[tuple[str, float]]) -> dict[str, list[float]]:
-        grouped: dict[str, list[float]] = {}
-
+        words: dict[str, list[float]] = {}
         for letter, value in words_list:
-            grouped.setdefault(letter, []).append(value)
+            words.setdefault(letter, []).append(value)
 
-        return grouped
+        return {"words": words,"comments": comments, "param_sets": param_sets}
 
-    def _last_word(self, words: dict[str, list[float]], letter: str) -> Optional[float]:
-        values = words.get(letter.upper())
-        if not values:
-            return None
-        return values[-1]
+    def _validate_repeats(self, block: dict[str, Any]) -> None:
+        words = block["words"]
+        for letter, values in words.items():
+            if letter not in {"G", "M"} and len(values) > 1:
+                raise RuntimeError(f"Repeated {letter} word on one line")
 
-    def _handle_non_motion_words(self, words: dict[str, list[float]], ir:list[Any]) -> None:
-        # F
-        f = self._last_word(words, "F")
+        if len(words.get("M", [])) > 4:
+            raise RuntimeError("More than four M words on one line")
+
+    def _validate_modal_groups(self, block: dict[str, Any]) -> None:
+        g_seen: dict[int, str] = {}
+        for raw in block["words"].get("G", []):
+            g = self._normalize_code(raw)
+            group = self._g_group(g)
+            if group is None:
+                raise RuntimeError(f"Unsupported G code {g}")
+            if group != 0 and group in g_seen:
+                raise RuntimeError(f"Two G codes from modal group {group}: {g_seen[group]} and {g}")
+            if group != 0:
+                g_seen[group] = g
+
+        m_seen: dict[int, int] = {}
+        for raw in block["words"].get("M", []):
+            m = self._to_int(raw, "M")
+            group = self._m_group(m)
+            if group is None:
+                raise RuntimeError(f"Unsupported M code M{m}")
+            if group in m_seen:
+                # M7 and M8 may both be active
+                if not (group == 8 and {m_seen[group], m} == {7, 8}):
+                    raise RuntimeError(f"Two M codes from modal group {group}: M{m_seen[group]} and M{m}")
+            m_seen[group] = m
+
+    def _exec_feed_mode(self, block):
+        for g in self._g_codes(block, group=5):
+            if g == "G93":
+                self.feed_mode = "inverse_time"
+            elif g == "G94":
+                self.feed_mode = "units_per_min"
+
+    def _exec_feed(self, block, ir):
+        f = self._last(block, "F")
         if f is not None:
+            if f < 0:
+                raise RuntimeError("Feed rate cannot be negative")
+            if self.units == "inch":
+                f *= 25.4
             self.feed = f
             ir.append(SetFeed(f))
 
-        # S word ignored for now, later: SetSpindleSpeed
+    def _exec_spindle_speed(self, block, ir):
+        s = self._last(block, "S")
+        if s is not None:
+            if s < 0:
+                raise RuntimeError("Spindle speed cannot be negative")
+            self.spindle_speed = s
+            ir.append(SetSpindleSpeed(s))
 
-        # T
-        t = self._last_word(words, "F")
+    def _exec_select_tool(self, block, ir):
+        t = self._last(block, "T")  # fixed: not F
         if t is not None:
-            self.tool = self._to_int(t, "T")
-            ir.append(SetTool(self.tool))
+            tool = self._to_int(t, "T")
+            if tool < 0:
+                raise RuntimeError("Tool number cannot be negative")
+            self.selected_tool = tool
+            ir.append(SetTool(tool))
 
-        # G
-        for g in words.get("G", []):
-            self._handle_g_code(g, ir)
-
-        for m in words.get("M", []):
-            self._handle_m_code(m, ir)
-
-    # handle G code that change modal state
-    def _handle_g_code(self, gval: float, ir: list[Any]) -> None:
-        g = self._normalize_code(gval)
-
-        if g == "G0":
-            self.motion_mode = "G0"
-        elif g == "G1":
-            self.motion_mode = "G1"
-        elif g == "G2":
-            self.motion_mode = "G2"
-        elif g == "G3":
-            self.motion_mode = "G3"
-
-        elif g == "G20":
-            self.units = "inch"
-            ir.append(SetUnits("inch"))
-        elif g == "G21":
-            self.units = "mm"
-            ir.append(SetUnits("mm"))
-
-        elif g == "G90":
-            self.absolute = True
-        elif g == "G91":
-            self.absolute = False
-
-        elif g == "G80":
-            self.motion_mode = "G80"
-
-        # else ignore other G codes for now
-
-    def _handle_m_code(self, mval, ir):
-        m = self._to_int(mval, "M")
-
-        if m == 3:
-            # spindle on
-            ir.append(SpindleOn(clockwise=True))
-        elif m == 4:
-            ir.append(SpindleOn(clockwise=False))
-        elif m == 5:
-            # spindle off
+    def _exec_tool_change(self, block, ir):
+        if 6 in self._m_codes(block):
+            self.current_tool = self.selected_tool
+            ir.append(ChangeTool(self.current_tool))
             ir.append(SpindleOff())
-        elif m in (2, 30):
-            ir.append(ProgramEnd())
-            self.ended = True
 
-    def _handle_motion(self, words: dict[str, list[float]], ir: list[Any]) -> None:
-        coords = self._read_coords(words)
+    def _exec_spindle(self, block, ir):
+        for m in self._m_codes(block):
+            if m == 3:
+                ir.append(SpindleOn(clockwise=True))
+            elif m == 4:
+                ir.append(SpindleOn(clockwise=False))
+            elif m == 5:
+                ir.append(SpindleOff())
 
-        has_axis_motion = any(coords[a] is not None for a in ("X", "Y", "Z"))
+    def _exec_coolant(self, block, ir):
+        ms = self._m_codes(block)
+        if 7 in ms:
+            ir.append(CoolantMistOn())
+        if 8 in ms:
+            ir.append(CoolantFloodOn())
+        if 9 in ms:
+            ir.append(CoolantOff())
 
-        if not has_axis_motion:
+    def _exec_dwell(self, block, ir):
+        if "G4" in self._g_codes(block, group=0):
+            p = self._last(block, "P")
+            if p is None:
+                raise RuntimeError("G4 requires P word")
+            if p < 0:
+                raise RuntimeError("G4 P value cannot be negative")
+            ir.append(Dwell(p))
+
+    def _exec_plane(self, block):
+        for g in self._g_codes(block, group=2):
+            if g == "G17":
+                self.plane = "XY"
+            elif g == "G18":
+                self.plane = "XZ"
+            elif g == "G19":
+                self.plane = "YZ"
+
+    def _exec_units(self, block, ir):
+        for g in self._g_codes(block, group=6):
+            if g == "G20":
+                self.units = "inch"
+                ir.append(SetUnits("inch"))
+            elif g == "G21":
+                self.units = "mm"
+                ir.append(SetUnits("mm"))
+
+    def _exec_distance_mode(self, block):
+        for g in self._g_codes(block, group=3):
+            if g == "G90":
+                self.distance_mode = "absolute"
+            elif g == "G91":
+                self.distance_mode = "incremental"
+
+    def _exec_motion(self, block, ir):
+        # Update modal motion first.
+        for g in self._g_codes(block, group=1):
+            self.motion_mode = g
+
+        coords = self._coords(block)
+        has_xyz = any(coords[a] is not None for a in ("X", "Y", "Z"))
+
+        if self.motion_mode == "G80":
+            if has_xyz:
+                raise RuntimeError("Axis words are not allowed while G80 is active")
             return
 
-        target_x = self.x
-        target_y = self.y
-        target_z = self.z
+        if not has_xyz:
+            return
 
-        if coords["X"] is not None:
-            target_x = coords["X"] if self.absolute else self.x + coords["X"]
+        if self.feed_mode == "inverse_time" and self.motion_mode in {"G1", "G2", "G3"} and self._last(block,"F") is None:
+            raise RuntimeError("G93 inverse-time mode requires F on every G1/G2/G3 motion line")
 
-        if coords["Y"] is not None:
-            target_y = coords["Y"] if self.absolute else self.y + coords["Y"]
-
-        if coords["Z"] is not None:
-            target_z = coords["Z"] if self.absolute else self.z + coords["Z"]
+        tx = self._target("X", coords)
+        ty = self._target("Y", coords)
+        tz = self._target("Z", coords)
 
         if self.motion_mode == "G0":
-            ir.append(RapidMove(target_x, target_y, target_z))
-            self._set_position(target_x, target_y, target_z)
+            ir.append(RapidMove(tx, ty, tz))
+            self._set_position(tx, ty, tz)
 
         elif self.motion_mode == "G1":
-            ir.append(LinearMove(target_x, target_y, target_z, self.feed))
-            self._set_position(target_x, target_y, target_z)
+            ir.append(LinearMove(tx, ty, tz, self.feed))
+            self._set_position(tx, ty, tz)
 
-        elif self.motion_mode == ("G2", "G3"):
-            clockwise = self.motion_mode == "G2"
+        elif self.motion_mode in {"G2", "G3"}:
+            arc = self._make_arc(coords, tx, ty, tz)
+            arc.clockwise = self.motion_mode == "G2"
+            arc.feed = self.feed
+            ir.append(arc)
+            self._set_position(tx, ty, tz)
 
-            i = coords["I"]
-            j = coords["J"]
-            r = coords["R"]
+        else:
+            raise RuntimeError(f"Motion mode {self.motion_mode} not implemented yet")
 
-            if i is None and j is None and r is None:
-                raise RuntimeError("Arc move requires I/J or R")
+    def _exec_stopping(self, block, ir):
+        for m in self._m_codes(block):
+            if m == 0:
+                ir.append(ProgramStop(optional=False))
+            elif m == 1:
+                ir.append(ProgramStop(optional=True))
+            elif m in {2, 30}:
+                ir.append(SpindleOff())
+                ir.append(CoolantOff())
+                ir.append(ProgramEnd())
+                self._reset_after_program_end()
+                self.ended = True
+            elif m == 60:
+                ir.append(ProgramStop(optional=False))
 
-            ir.append(
-                ArcMove(
-                    clockwise=clockwise,
-                    x=target_x,
-                    y=target_y,
-                    z=target_z,
-                    i=i,
-                    j=j,
-                    r=r,
-                )
-            )
+    def _make_arc(self, coords, tx, ty, tz) -> ArcMove:
+        if self.plane == "XY":
+            start = (self.x, self.y)
+            end = (tx, ty)
+            offsets = (coords["I"], coords["J"])
+            axis_end = tz
+            center3 = lambda c1, c2: (c1, c2, tz)
+        elif self.plane == "XZ":
+            start = (self.x, self.z)
+            end = (tx, tz)
+            offsets = (coords["I"], coords["K"])
+            axis_end = ty
+            center3 = lambda c1, c2: (c1, ty, c2)
+        else:  # YZ
+            start = (self.y, self.z)
+            end = (ty, tz)
+            offsets = (coords["J"], coords["K"])
+            axis_end = tx
+            center3 = lambda c1, c2: (tx, c1, c2)
 
-            self._set_position(target_x, target_y, target_z)
+        r = coords["R"]
+        if r is not None:
+            c1, c2 = self._arc_center_from_radius(start, end, r, clockwise=(self.motion_mode == "G2"))
+            rotation = -1 if self.motion_mode == "G2" else 1
+        else:
+            if offsets[0] is None and offsets[1] is None:
+                raise RuntimeError("Center-format arc requires plane offsets: I/J, I/K, or J/K")
+            off1 = offsets[0] or 0.0
+            off2 = offsets[1] or 0.0
+            c1, c2 = start[0] + off1, start[1] + off2
+            self._check_arc_radius(start, end, (c1, c2))
+            rotation = -1 if self.motion_mode == "G2" else 1
 
-        elif self.motion_mode == "G80":
-            raise RuntimeError("Axis words are not allowed while G80 is active")
+        cx, cy, cz = center3(c1, c2)
+        return ArcMove(
+            clockwise=(self.motion_mode == "G2"),
+            plane=self.plane,
+            x=tx,
+            y=ty,
+            z=tz,
+            center_x=cx,
+            center_y=cy,
+            center_z=cz,
+            rotation=rotation,
+            feed=self.feed,
+        )
 
-    def _read_coords(self, words: dict[str, list[float]]) -> dict[str, Optional[float]]:
-        coords: dict[str, Optional[float]] = {}
+    def _arc_center_from_radius(self, start, end, r, clockwise: bool):
+        sx, sy = start
+        ex, ey = end
+        dx, dy = ex - sx, ey - sy
+        chord = math.hypot(dx, dy)
+        if chord <= self.EPS:
+            raise RuntimeError("Radius-format arc endpoint cannot equal current point")
+        if abs(r) < chord / 2:
+            raise RuntimeError("Arc radius too small for endpoints")
+
+        mx, my = (sx + ex) / 2, (sy + ey) / 2
+        h = math.sqrt(max(r * r - (chord / 2) ** 2, 0.0))
+        ux, uy = -dy / chord, dx / chord
+
+        # Positive R means <=180 degrees; negative R means >180 degrees.
+        sign = -1 if clockwise else 1
+        if r < 0:
+            sign *= -1
+
+        return mx + sign * ux * h, my + sign * uy * h
+
+    def _check_arc_radius(self, start, end, center):
+        r1 = math.hypot(start[0] - center[0], start[1] - center[1])
+        r2 = math.hypot(end[0] - center[0], end[1] - center[1])
+        tolerance = 0.002 if self.units == "mm" else 0.0002
+        if abs(r1 - r2) > tolerance:
+            raise RuntimeError(f"Arc radii differ too much: start={r1}, end={r2}")
+
+    def _coords(self, block) -> dict[str, Optional[float]]:
+        # here happens unit convertion
+        result = {}
 
         for letter in ("X", "Y", "Z", "I", "J", "K", "R"):
-            value = self._last_word(words, letter)
+            value = self._last(block, letter)
 
             if value is not None and self.units == "inch":
                 value *= 25.4
 
-            coords[letter] = value
+            result[letter] = value
 
-        return coords
+        return result
+
+    def _target(self, axis: str, coords: dict[str, Optional[float]]) -> float:
+        current = {"X": self.x, "Y": self.y, "Z": self.z}[axis]
+        value = coords[axis]
+        if value is None:
+            return current
+        if self.distance_mode == "absolute":
+            return value
+        return current + value
 
     def _set_position(self, x: float, y: float, z: float) -> None:
         self.x = x
         self.y = y
         self.z = z
 
+    def _reset_after_program_end(self):
+        self.motion_mode = "G1"
+        self.plane = "XY"
+        self.distance_mode = "absolute"
+        self.feed_mode = "units_per_min"
+
+    def _last(self, block, letter: str) -> Optional[float]:
+        values = block["words"].get(letter.upper())
+        return values[-1] if values else None
+
+    def _g_codes(self, block, group: Optional[int] = None) -> list[str]:
+        codes = [self._normalize_code(v) for v in block["words"].get("G", [])]
+        if group is None:
+            return codes
+        return [g for g in codes if self._g_group(g) == group]
+
+    def _m_codes(self, block) -> list[int]:
+        return [self._to_int(v, "M") for v in block["words"].get("M", [])]
+
+    def _g_group(self, g: str) -> Optional[int]:
+        for group, codes in self.G_GROUPS.items():
+            if g in codes:
+                return group
+        return None
+
+    def _m_group(self, m: int) -> Optional[int]:
+        for group, codes in self.M_GROUPS.items():
+            if m in codes:
+                return group
+        return None
+
     def _to_int(self, value: float, name: str) -> int:
         rounded = round(value)
 
-        if abs(value - rounded) > 0.0001:
+        if abs(value - rounded) > self.EPS:
             raise RuntimeError(f"{name} value must be close to integer, got {value}")
 
         return int(rounded)
@@ -321,7 +557,7 @@ class NistInterpreter:
         38.2 -> G38.2
         59.3 -> G59.3
         """
-        if abs(value - round(value)) <= 0.0001:
+        if abs(value - round(value)) <= self.EPS:
             return f"G{int(round(value))}"
 
         return f"G{value:g}"
