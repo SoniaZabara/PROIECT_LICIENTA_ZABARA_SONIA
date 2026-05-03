@@ -1,11 +1,9 @@
-from nist_parser import NistParser
-from nist_transformer import NistTransformer
-from nist_interpreter import NistInterpreter
-from hpgl_postprocessor import HPGLPostProcessor
-import json
-from dataclasses import asdict
+from translator.nist_parser import NistParser
+from translator.nist_transformer import NistTransformer
+from translator.nist_interpreter import NistInterpreter
+from translator.hpgl_postprocessor import HPGLPostProcessor
 
-INPUT_PATH = "sample_c1.gcode"
+INPUT_PATH = "sample_gcode/sample_c1.gcode"
 
 if __name__ == "__main__":
     parser = NistParser()

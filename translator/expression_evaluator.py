@@ -1,7 +1,7 @@
 import math
 
 # these dataclasses contain pure expressions
-from nist_transformer import (
+from translator.nist_transformer import (
     RealNumber,
     ParameterRef,
     UnaryOp,

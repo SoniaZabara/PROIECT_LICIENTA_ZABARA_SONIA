@@ -1,6 +1,6 @@
 from lark import Lark
 
-GRAMMAR_PATH = "nist_gc.lark"
+GRAMMAR_PATH = "translator/nist_gc.lark"
 
 class NistParser:
     def __init__(self):

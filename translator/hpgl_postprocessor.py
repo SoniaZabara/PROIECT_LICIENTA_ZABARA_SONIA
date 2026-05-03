@@ -1,7 +1,7 @@
 import math
 from typing import Any
 
-from nist_interpreter import (
+from translator.nist_interpreter import (
     RapidMove,
     LinearMove,
     ArcMove,

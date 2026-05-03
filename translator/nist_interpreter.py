@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Optional, Any
 import math
 
-from nist_transformer import (
+from translator.nist_transformer import (
     Program,
     Line,
     MidLineWord,
@@ -10,7 +10,7 @@ from nist_transformer import (
     Comment,
 )
 
-from expression_evaluator import ExpressionEvaluator
+from translator.expression_evaluator import ExpressionEvaluator
 
 # IR (Intermediate Representation) dataclasses
 @dataclass
