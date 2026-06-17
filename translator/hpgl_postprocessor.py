@@ -30,8 +30,9 @@ class HPGLPostProcessor:
 
     STEP_MM = 0.0079375 # 7.9375 micrometers / step
 
-    def __init__(self):
+    def __init__(self, include_comments: bool = False):
         self.commands: list[str] = []
+        self.include_comments = include_comments
         self.x = 0.0
         self.y = 0.0
         self.z = 0.0
@@ -59,7 +60,8 @@ class HPGLPostProcessor:
 
     def translate_item(self, item: Any):
         if isinstance(item, CommentIR):
-            self.emit(f"/* {item.text} */")
+            if self.include_comments:
+                self.emit(f"/* {item.text} */")
 
         elif isinstance(item, SetUnits):
             # Interpreter already normalizes inch coordinates to mm
@@ -112,14 +114,16 @@ class HPGLPostProcessor:
 
         elif isinstance(item, SetTool):
             # G-code T word: selects tool, but does not physically change it!!!
-            self.emit(f"/* Select tool {item.tool} */") # IF you have machine with tool change, REPLACE comment with a command ex: self.emit("ST;")
+            if self.include_comments:
+                self.emit(f"/* Select tool {item.tool} */") # IF you have machine with tool change, REPLACE comment with a command ex: self.emit("ST;")
 
         elif isinstance(item, ChangeTool):
             # G-code M6: tool change
             # LPKF handling depends on your machine/workflow
             self.emit("PU;")
             self.emit("!EM0;")
-            self.emit(f"/* Change tool to {item.tool} */")
+            if self.include_comments:
+                self.emit(f"/* Change tool to {item.tool} */")
 
         else:
             raise RuntimeError(f"Unsupported IR command: {item}")

@@ -233,6 +233,7 @@ class SerialWorker(QObject):
         self._stop_streaming = True
 
 def split_hpgl_commands(text: str) -> list[str]:
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
     text = text.replace("\n", "").replace("\r", "")
     parts = re.split(r"[;:]", text)
     return [p.strip() for p in parts if p.strip()]
