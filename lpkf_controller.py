@@ -314,8 +314,10 @@ class MainWindow(QMainWindow):
         self.baud_label = QLabel("9600")
         self.baud_label.setToolTip("The LPKF ProtoMat M60 uses 9600 baud.")
 
-        self.hw_handshake = QCheckBox("RTS/CTS hardware handshake")
+        self.hw_handshake = QCheckBox("RTS/CTS hardware handshake (required)")
         self.hw_handshake.setChecked(True)
+        self.hw_handshake.setEnabled(False)
+        self.hw_handshake.setToolTip("Required for communication with the LPKF ProtoMat M60.")
 
         self.connect_btn = QPushButton("Connect")
         self.connect_btn.clicked.connect(self.connect_serial)
@@ -505,7 +507,7 @@ class MainWindow(QMainWindow):
         cfg = SerialConfig(
             port=port,
             baudrate=9600,
-            rtscts=self.hw_handshake.isChecked(),
+            rtscts=True,
         )
         self.connect_requested.emit(cfg)
 
