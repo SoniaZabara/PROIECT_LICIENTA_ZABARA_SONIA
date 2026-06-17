@@ -87,6 +87,7 @@ class SerialWorker(QObject):
         self.ser: Optional[serial.Serial] = None
         self._streaming = False
         self._stop_streaming = False
+        self._rx_buffer = ""
 
     @Slot(object)
     def connect_port(self, cfg: SerialConfig):
@@ -153,32 +154,52 @@ class SerialWorker(QObject):
     def read_available(self):
         self._read_available()
 
-    def _read_available(self):
+    def _handle_received_line(self, line: str) -> bool:
+        line = line.strip()
+        if not line:
+            return False
+
+        self.log.emit(f"<< {line}")
+        if line == "C":
+            return True
+
+        self.line_received.emit(line)
+        self._parse_machine_response(line)
+        return False
+
+    def _read_lines_until(self, deadline: float) -> bool:
         if not self.ser or not self.ser.is_open:
-            return
+            return False
 
+        acknowledged = False
+
+        while time.time() < deadline:
+            waiting = self.ser.in_waiting
+            if not waiting:
+                time.sleep(0.01)
+                continue
+
+            self._rx_buffer += self.ser.read(waiting).decode("ascii", errors="replace")
+            parts = re.split(r"[\r\n]+", self._rx_buffer)
+            if self._rx_buffer.endswith(("\r", "\n")):
+                complete_lines = parts
+                self._rx_buffer = ""
+            else:
+                complete_lines = parts[:-1]
+                self._rx_buffer = parts[-1]
+
+            for line in complete_lines:
+                acknowledged = self._handle_received_line(line) or acknowledged
+
+        if self._rx_buffer.strip() == "C":
+            acknowledged = self._handle_received_line(self._rx_buffer) or acknowledged
+            self._rx_buffer = ""
+
+        return acknowledged
+
+    def _read_available(self):
         try:
-            chunks: list[bytes] = []
-            deadline = time.time() + 0.25
-            while time.time() < deadline:
-                waiting = self.ser.in_waiting
-                if waiting:
-                    chunks.append(self.ser.read(waiting))
-                    time.sleep(0.03)
-                else:
-                    time.sleep(0.02)
-
-            if not chunks:
-                return
-
-            text = b"".join(chunks).decode("ascii", errors="replace")
-            for line in re.split(r"[\r\n]+", text):
-                line = line.strip()
-                if not line:
-                    continue
-                self.log.emit(f"<< {line}")
-                self.line_received.emit(line)
-                self._parse_machine_response(line)
+            self._read_lines_until(time.time() + 0.25)
         except Exception as exc:
             self.error.emit(f"Read error: {exc}")
 
@@ -201,8 +222,42 @@ class SerialWorker(QObject):
         elif line.startswith("S"):
             self.status_received.emit(line)
 
-    @Slot(list, float)
-    def stream_commands(self, commands: list[str], delay_s: float = 0.02):
+    def _normalize_command(self, command: str) -> str:
+        command = command.strip()
+        if command and not command.endswith(";") and not command.endswith(":"):
+            command += ";"
+        return command
+
+    def _write_command(self, command: str) -> str:
+        command = self._normalize_command(command)
+        self.ser.write(command.encode("ascii", errors="ignore"))
+        self.ser.flush()
+        self.log.emit(f">> {command}")
+        return command
+
+    def _wait_for_ack(self, command: str, timeout_s: float) -> None:
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if self._stop_streaming:
+                raise RuntimeError("Streaming interrupted by user.")
+            if self._read_lines_until(min(time.time() + 0.1, deadline)):
+                return
+
+        raise TimeoutError(f"No C acknowledgement received for {command}")
+
+    def _send_and_wait_ack(self, command: str, timeout_s: float) -> str:
+        sent = self._write_command(command)
+        self._wait_for_ack(sent, timeout_s)
+        return sent
+
+    @Slot(list, float, bool, float)
+    def stream_commands(
+        self,
+        commands: list[str],
+        delay_s: float = 0.02,
+        wait_for_ack: bool = True,
+        ack_timeout_s: float = 30.0,
+    ):
         if not self._ensure_connected():
             return
         if self._streaming:
@@ -213,31 +268,43 @@ class SerialWorker(QObject):
         self._stop_streaming = False
         total = len(commands)
 
+        echo_enabled = False
+
         try:
+            if wait_for_ack:
+                self.log.emit("Enabling echo acknowledgement mode with !CT1;")
+                self._send_and_wait_ack("!CT1;", ack_timeout_s)
+                echo_enabled = True
+
             for index, command in enumerate(commands, start=1):
                 if self._stop_streaming:
                     self.log.emit("Streaming interrupted by user.")
                     break
 
-                command = command.strip()
+                command = self._normalize_command(command)
                 if not command:
                     continue
-                if not command.endswith(";") and not command.endswith(":"):
-                    command += ";"
 
-                self.ser.write(command.encode("ascii", errors="ignore"))
-                self.ser.flush()
-                self.log.emit(f">> {command}")
+                if wait_for_ack:
+                    self._send_and_wait_ack(command, ack_timeout_s)
+                else:
+                    self._write_command(command)
+                    self._read_available()
+                    time.sleep(delay_s)
+
                 self.streaming_progress.emit(index, total)
-
-                # read small responses
-                self._read_available()
-                time.sleep(delay_s)
 
             self.streaming_finished.emit()
         except Exception as exc:
             self.error.emit(f"Streaming error: {exc}")
         finally:
+            if echo_enabled and self.ser and self.ser.is_open:
+                try:
+                    self.log.emit("Disabling echo acknowledgement mode with !CT0;")
+                    self._write_command("!CT0;")
+                    self._read_lines_until(time.time() + 0.5)
+                except Exception as exc:
+                    self.error.emit(f"Could not disable echo mode: {exc}")
             self._streaming = False
             self._stop_streaming = False
 
@@ -270,7 +337,7 @@ class MainWindow(QMainWindow):
     disconnect_requested = Signal()
     send_requested = Signal(str)
     read_requested = Signal()
-    stream_requested = Signal(list, float)
+    stream_requested = Signal(list, float, bool, float)
     stop_stream_requested = Signal()
 
     def __init__(self):
@@ -288,7 +355,10 @@ class MainWindow(QMainWindow):
         self.send_requested.connect(self.worker.send_command)
         self.read_requested.connect(self.worker.read_available)
         self.stream_requested.connect(self.worker.stream_commands)
-        self.stop_stream_requested.connect(self.worker.request_stop_streaming)
+        self.stop_stream_requested.connect(
+            self.worker.request_stop_streaming,
+            Qt.ConnectionType.DirectConnection,
+        )
 
         self.worker.connected.connect(self.on_connected)
         self.worker.disconnected.connect(self.on_disconnected)
@@ -501,12 +571,24 @@ class MainWindow(QMainWindow):
         self.stream_delay.setDecimals(3)
         self.stream_delay.setValue(0.02)
         self.stream_delay.setSuffix(" s delay")
+        self.stream_delay.setToolTip("Used only when echo acknowledgement streaming is disabled.")
+        self.ack_streaming = QCheckBox("Wait for C echo (!CT1)")
+        self.ack_streaming.setChecked(True)
+        self.ack_streaming.setToolTip("Safer streaming: enable !CT1 and wait for C before sending the next command.")
+        self.ack_timeout = QDoubleSpinBox()
+        self.ack_timeout.setRange(1.0, 120.0)
+        self.ack_timeout.setDecimals(1)
+        self.ack_timeout.setValue(30.0)
+        self.ack_timeout.setSuffix(" s ack")
+        self.ack_timeout.setToolTip("Maximum time to wait for one machine acknowledgement.")
         stream_btn = QPushButton("Stream file")
         stream_btn.clicked.connect(self.stream_file)
         stop_stream_btn = QPushButton("Stop streaming")
         stop_stream_btn.clicked.connect(lambda: self.stop_stream_requested.emit())
         file_buttons.addWidget(load_gcode_btn)
         file_buttons.addWidget(load_btn)
+        file_buttons.addWidget(self.ack_streaming)
+        file_buttons.addWidget(self.ack_timeout)
         file_buttons.addWidget(self.stream_delay)
         file_buttons.addWidget(stream_btn)
         file_buttons.addWidget(stop_stream_btn)
@@ -658,7 +740,12 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
 
-        self.stream_requested.emit(self.hpgl_commands, float(self.stream_delay.value()))
+        self.stream_requested.emit(
+            self.hpgl_commands,
+            float(self.stream_delay.value()),
+            self.ack_streaming.isChecked(),
+            float(self.ack_timeout.value()),
+        )
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.disconnect_requested.emit()
