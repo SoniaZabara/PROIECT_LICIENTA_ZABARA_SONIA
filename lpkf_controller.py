@@ -77,6 +77,8 @@ class SerialWorker(QObject):
     log = Signal(str)
     line_received = Signal(str)
     position_received = Signal(float, float, float)
+    limits_received = Signal(float, float, float)
+    status_received = Signal(str)
     streaming_progress = Signal(int, int)
     streaming_finished = Signal()
 
@@ -176,22 +178,28 @@ class SerialWorker(QObject):
                     continue
                 self.log.emit(f"<< {line}")
                 self.line_received.emit(line)
-                self._try_parse_position(line)
+                self._parse_machine_response(line)
         except Exception as exc:
             self.error.emit(f"Read error: {exc}")
 
-    def _try_parse_position(self, line: str):
-        """
-        HANDLES LIKELY RESPONSE DONT KNOW YET
-        """
+    def _parse_machine_response(self, line: str):
         nums = re.findall(r"[-+]?\d+(?:\.\d+)?", line)
-        # P is most likely not correct
-        if len(nums) >= 3 and (line.startswith("P") or line.startswith("W") or line.startswith("S")):
+        if line.startswith("P") and len(nums) >= 3:
             try:
                 x, y, z = float(nums[0]), float(nums[1]), float(nums[2])
                 self.position_received.emit(x, y, z)
             except ValueError:
                 pass
+
+        elif line.startswith("W") and len(nums) >= 3:
+            try:
+                x, y, z = float(nums[0]), float(nums[1]), float(nums[2])
+                self.limits_received.emit(x, y, z)
+            except ValueError:
+                pass
+
+        elif line.startswith("S"):
+            self.status_received.emit(line)
 
     @Slot(list, float)
     def stream_commands(self, commands: list[str], delay_s: float = 0.02):
@@ -287,6 +295,8 @@ class MainWindow(QMainWindow):
         self.worker.error.connect(self.show_error)
         self.worker.log.connect(self.append_log)
         self.worker.position_received.connect(self.update_position)
+        self.worker.limits_received.connect(self.update_limits)
+        self.worker.status_received.connect(self.update_machine_status)
         self.worker.streaming_progress.connect(self.update_progress)
         self.worker.streaming_finished.connect(self.on_stream_finished)
 
@@ -367,10 +377,14 @@ class MainWindow(QMainWindow):
         self.z_label.setEnabled(False)
         self.z_label.setToolTip("Not used for the M60 MVP interface; the spindle is controlled as up/down, not as a variable Z position.")
         self.progress_label = QLabel("File: —")
+        self.limits_label = QLabel("Limits: -")
+        self.status_label = QLabel("Status: -")
         status_layout.addWidget(self.x_label, 0, 0)
         status_layout.addWidget(self.y_label, 0, 1)
         status_layout.addWidget(self.z_label, 0, 2)
         status_layout.addWidget(self.progress_label, 1, 0, 1, 3)
+        status_layout.addWidget(self.limits_label, 2, 0, 1, 3)
+        status_layout.addWidget(self.status_label, 3, 0, 1, 3)
 
         query_status = QPushButton("Query OS;")
         query_status.clicked.connect(lambda: self.send_requested.emit("OS;"))
@@ -378,9 +392,9 @@ class MainWindow(QMainWindow):
         query_limits.clicked.connect(lambda: self.send_requested.emit("OH;"))
         query_pos = QPushButton("Query !ON0;")
         query_pos.clicked.connect(lambda: self.send_requested.emit("!ON0;"))
-        status_layout.addWidget(query_status, 2, 0)
-        status_layout.addWidget(query_limits, 2, 1)
-        status_layout.addWidget(query_pos, 2, 2)
+        status_layout.addWidget(query_status, 4, 0)
+        status_layout.addWidget(query_limits, 4, 1)
+        status_layout.addWidget(query_pos, 4, 2)
         left.addWidget(status_group)
 
         # Manual control
@@ -561,6 +575,12 @@ class MainWindow(QMainWindow):
         # Z is intentionally not updated in the interface
         # because spindle motion tool is up/down only
         self.z_label.setText("Z: —")
+
+    def update_limits(self, x: float, y: float, z: float):
+        self.limits_label.setText(f"Limits: X {x:g}, Y {y:g}, Z {z:g}")
+
+    def update_machine_status(self, status: str):
+        self.status_label.setText(f"Status: {status}")
 
     def update_progress(self, index: int, total: int):
         self.progress_label.setText(f"File: {index}/{total} commands")
