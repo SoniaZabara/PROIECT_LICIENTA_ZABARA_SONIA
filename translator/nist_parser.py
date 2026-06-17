@@ -1,11 +1,12 @@
 from lark import Lark
+from pathlib import Path
 
-GRAMMAR_PATH = "translator/nist_gc.lark"
+GRAMMAR_PATH = Path(__file__).with_name("nist_gc.lark")
 
 class NistParser:
     def __init__(self):
         self.parser = Lark.open(
-            GRAMMAR_PATH,
+            str(GRAMMAR_PATH),
             start="start",
             parser="lalr",
             debug=True

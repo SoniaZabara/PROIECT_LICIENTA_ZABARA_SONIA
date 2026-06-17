@@ -9,6 +9,7 @@ Features:
 - Manual jog controls
 - Spindle on/off
 - Pause / resume / clear buffer commands
+- G-code loading and translation to HP-GL
 - HP-GL file loading, preview, and safe line-by-line streaming
 
 Typical LPKF M60 settings for serial communication from the manual:
@@ -30,6 +31,10 @@ from typing import Optional
 
 import serial
 import serial.tools.list_ports
+from translator.hpgl_postprocessor import HPGLPostProcessor
+from translator.nist_interpreter import NistInterpreter
+from translator.nist_parser import NistParser
+from translator.nist_transformer import NistTransformer
 from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot, Qt
 from PySide6.QtGui import QAction, QFont
 from PySide6.QtWidgets import (
@@ -238,6 +243,20 @@ def split_hpgl_commands(text: str) -> list[str]:
     parts = re.split(r"[;:]", text)
     return [p.strip() for p in parts if p.strip()]
 
+
+def translate_gcode_to_hpgl(path: Path) -> str:
+    parser = NistParser()
+    parse_tree = parser.parse(input_path=str(path))
+
+    transformer = NistTransformer()
+    ast_tree = transformer.transform(parse_tree)
+
+    interpreter = NistInterpreter()
+    ir = interpreter.interpret(ast_tree)
+
+    post = HPGLPostProcessor()
+    return post.translate(ir)
+
 class MainWindow(QMainWindow):
     connect_requested = Signal(object)
     disconnect_requested = Signal()
@@ -286,6 +305,10 @@ class MainWindow(QMainWindow):
         load_action = QAction("Load HP-GL...", self)
         load_action.triggered.connect(self.load_hpgl_file)
         file_menu.addAction(load_action)
+
+        load_gcode_action = QAction("Load G-code...", self)
+        load_gcode_action.triggered.connect(self.load_gcode_file)
+        file_menu.addAction(load_gcode_action)
 
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.close)
@@ -450,10 +473,13 @@ class MainWindow(QMainWindow):
         left.addWidget(raw_group)
         left.addStretch(1)
 
-        # HPGL panel
-        file_group = QGroupBox("HP-GL file")
+        # Job file
+        file_group = QGroupBox("Job file / HP-GL output")
         file_layout = QVBoxLayout(file_group)
         file_buttons = QHBoxLayout()
+        load_gcode_btn = QPushButton("Load G-code")
+        load_gcode_btn.setToolTip("Translate an RS274/NGC G-code file to HP-GL.")
+        load_gcode_btn.clicked.connect(self.load_gcode_file)
         load_btn = QPushButton("Load HP-GL")
         load_btn.clicked.connect(self.load_hpgl_file)
         self.stream_delay = QDoubleSpinBox()
@@ -465,13 +491,14 @@ class MainWindow(QMainWindow):
         stream_btn.clicked.connect(self.stream_file)
         stop_stream_btn = QPushButton("Stop streaming")
         stop_stream_btn.clicked.connect(lambda: self.stop_stream_requested.emit())
+        file_buttons.addWidget(load_gcode_btn)
         file_buttons.addWidget(load_btn)
         file_buttons.addWidget(self.stream_delay)
         file_buttons.addWidget(stream_btn)
         file_buttons.addWidget(stop_stream_btn)
 
         self.preview = QPlainTextEdit()
-        self.preview.setPlaceholderText("Loaded HP-GL commands will appear here.")
+        self.preview.setPlaceholderText("Loaded or translated HP-GL commands will appear here.")
         self.preview.setFont(QFont("Courier New", 10))
         file_layout.addLayout(file_buttons)
         file_layout.addWidget(self.preview, 2)
@@ -577,9 +604,29 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.show_error(f"Could not load file: {exc}")
 
+    def load_gcode_file(self):
+        path_str, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load G-code file",
+            "",
+            "G-code files (*.gcode *.gc *.ngc *.nc *.tap *.txt);;All files (*.*)",
+        )
+        if not path_str:
+            return
+
+        path = Path(path_str)
+        try:
+            hpgl = translate_gcode_to_hpgl(path)
+            self.hpgl_commands = split_hpgl_commands(hpgl)
+            self.preview.setPlainText(";\n".join(self.hpgl_commands) + (";" if self.hpgl_commands else ""))
+            self.progress_label.setText(f"File: {len(self.hpgl_commands)} translated commands")
+            self.append_log(f"Translated {path.name}: {len(self.hpgl_commands)} HP-GL commands.")
+        except Exception as exc:
+            self.show_error(f"Could not translate G-code file: {exc}")
+
     def stream_file(self) -> None:
         if not self.hpgl_commands:
-            self.show_error("No HP-GL file loaded.")
+            self.show_error("No HP-GL job loaded.")
             return
 
         answer = QMessageBox.question(
