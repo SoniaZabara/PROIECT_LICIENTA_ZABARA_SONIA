@@ -77,6 +77,8 @@ class HPGLPostProcessor:
             self.emit(f"!RM{rpm_thousands};")
 
         elif isinstance(item, SpindleOn):
+            if not item.clockwise:
+                raise RuntimeError("M4 counterclockwise spindle is not supported by this LPKF profile.")
             self.emit("!EM1;")
 
         elif isinstance(item, SpindleOff):
@@ -110,7 +112,6 @@ class HPGLPostProcessor:
 
         elif isinstance(item, ProgramEnd):
             self.emit("PU;")
-            self.emit("!EM0;")
 
         elif isinstance(item, SetTool):
             # G-code T word: selects tool, but does not physically change it!!!
@@ -121,7 +122,6 @@ class HPGLPostProcessor:
             # G-code M6: tool change
             # LPKF handling depends on your machine/workflow
             self.emit("PU;")
-            self.emit("!EM0;")
             if self.include_comments:
                 self.emit(f"/* Change tool to {item.tool} */")
 
