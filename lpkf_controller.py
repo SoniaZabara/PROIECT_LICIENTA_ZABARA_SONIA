@@ -35,7 +35,6 @@ from translator.hpgl_postprocessor import HPGLPostProcessor
 from translator.nist_interpreter import NistInterpreter
 from translator.nist_parser import NistParser
 from translator.nist_transformer import NistTransformer
-from translator.preflight import PreflightReport, preflight_gcode_file, preflight_hpgl_commands
 from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot, Qt
 from PySide6.QtGui import QAction, QFont
 from PySide6.QtWidgets import (
@@ -372,7 +371,6 @@ class MainWindow(QMainWindow):
         self.worker.streaming_finished.connect(self.on_stream_finished)
 
         self.hpgl_commands: list[str] = []
-        self.preflight_report: Optional[PreflightReport] = None
         self._build_ui()
         self._build_menu()
         self.refresh_ports()
@@ -583,9 +581,8 @@ class MainWindow(QMainWindow):
         self.ack_timeout.setValue(30.0)
         self.ack_timeout.setSuffix(" s ack")
         self.ack_timeout.setToolTip("Maximum time to wait for one machine acknowledgement.")
-        self.stream_btn = QPushButton("Stream file")
-        self.stream_btn.clicked.connect(self.stream_file)
-        self.stream_btn.setEnabled(False)
+        stream_btn = QPushButton("Stream file")
+        stream_btn.clicked.connect(self.stream_file)
         stop_stream_btn = QPushButton("Stop streaming")
         stop_stream_btn.clicked.connect(lambda: self.stop_stream_requested.emit())
         file_buttons.addWidget(load_gcode_btn)
@@ -593,19 +590,14 @@ class MainWindow(QMainWindow):
         file_buttons.addWidget(self.ack_streaming)
         file_buttons.addWidget(self.ack_timeout)
         file_buttons.addWidget(self.stream_delay)
-        file_buttons.addWidget(self.stream_btn)
+        file_buttons.addWidget(stream_btn)
         file_buttons.addWidget(stop_stream_btn)
 
         self.preview = QPlainTextEdit()
         self.preview.setPlaceholderText("Loaded or translated HP-GL commands will appear here.")
         self.preview.setFont(QFont("Courier New", 10))
-        self.preflight_view = QPlainTextEdit()
-        self.preflight_view.setReadOnly(True)
-        self.preflight_view.setMaximumHeight(120)
-        self.preflight_view.setPlaceholderText("Preflight results will appear here.")
         file_layout.addLayout(file_buttons)
         file_layout.addWidget(self.preview, 2)
-        file_layout.addWidget(self.preflight_view, 1)
         right.addWidget(file_group, 2)
 
         # Log
@@ -694,36 +686,6 @@ class MainWindow(QMainWindow):
         if answer == QMessageBox.StandardButton.Yes:
             self.send_requested.emit(command)
 
-    def update_preflight_report(self) -> None:
-        if self.preflight_report is None:
-            self.preflight_view.clear()
-            self.stream_btn.setEnabled(False)
-            return
-
-        self.preflight_view.setPlainText(self.preflight_report.text())
-        self.stream_btn.setEnabled(bool(self.hpgl_commands) and not self.preflight_report.has_blocks())
-
-    def confirm_preflight_warnings(self) -> bool:
-        if self.preflight_report is None:
-            return True
-
-        warnings = self.preflight_report.warnings()
-        if not warnings:
-            return True
-
-        preview = "\n".join(issue.format() for issue in warnings[:8])
-        if len(warnings) > 8:
-            preview += f"\n...and {len(warnings) - 8} more warning(s)."
-
-        answer = QMessageBox.question(
-            self,
-            "Preflight warnings",
-            "This job has warnings that require operator awareness:\n\n"
-            f"{preview}\n\n"
-            "Continue anyway?",
-        )
-        return answer == QMessageBox.StandardButton.Yes
-
     def load_hpgl_file(self):
         path_str, _ = QFileDialog.getOpenFileName(
             self,
@@ -738,16 +700,10 @@ class MainWindow(QMainWindow):
         try:
             text = path.read_text(encoding="ascii", errors="ignore")
             self.hpgl_commands = split_hpgl_commands(text)
-            self.preflight_report = preflight_hpgl_commands(self.hpgl_commands, source=f"HP-GL {path.name}")
             self.preview.setPlainText(";\n".join(self.hpgl_commands) + (";" if self.hpgl_commands else ""))
             self.progress_label.setText(f"File: {len(self.hpgl_commands)} commands loaded")
             self.append_log(f"Loaded {path.name}: {len(self.hpgl_commands)} commands.")
-            self.update_preflight_report()
         except Exception as exc:
-            self.hpgl_commands = []
-            self.preflight_report = None
-            self.preview.clear()
-            self.update_preflight_report()
             self.show_error(f"Could not load file: {exc}")
 
     def load_gcode_file(self):
@@ -762,39 +718,17 @@ class MainWindow(QMainWindow):
 
         path = Path(path_str)
         try:
-            self.preflight_report = preflight_gcode_file(path)
-            if self.preflight_report.has_blocks():
-                self.hpgl_commands = []
-                self.preview.setPlainText(path.read_text(encoding="utf-8", errors="replace"))
-                self.progress_label.setText("File: blocked by preflight")
-                self.append_log(f"Blocked {path.name}: preflight found unsupported commands.")
-                self.update_preflight_report()
-                return
-
             hpgl = translate_gcode_to_hpgl(path)
             self.hpgl_commands = split_hpgl_commands(hpgl)
-            hpgl_report = preflight_hpgl_commands(self.hpgl_commands, source=f"Translated HP-GL {path.name}")
-            self.preflight_report.issues.extend(hpgl_report.issues)
             self.preview.setPlainText(";\n".join(self.hpgl_commands) + (";" if self.hpgl_commands else ""))
             self.progress_label.setText(f"File: {len(self.hpgl_commands)} translated commands")
             self.append_log(f"Translated {path.name}: {len(self.hpgl_commands)} HP-GL commands.")
-            self.update_preflight_report()
         except Exception as exc:
-            self.hpgl_commands = []
-            self.preview.clear()
-            self.update_preflight_report()
             self.show_error(f"Could not translate G-code file: {exc}")
 
     def stream_file(self) -> None:
         if not self.hpgl_commands:
             self.show_error("No HP-GL job loaded.")
-            return
-
-        if self.preflight_report and self.preflight_report.has_blocks():
-            self.show_error("Preflight has BLOCK issues. Streaming is disabled for this job.")
-            return
-
-        if not self.confirm_preflight_warnings():
             return
 
         answer = QMessageBox.question(

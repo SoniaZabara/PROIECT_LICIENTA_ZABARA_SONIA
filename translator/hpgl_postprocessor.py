@@ -33,9 +33,6 @@ class HPGLPostProcessor:
     def __init__(self, include_comments: bool = False):
         self.commands: list[str] = []
         self.include_comments = include_comments
-        self.pen_is_down = False
-        self.current_feed_command = None
-        self.spindle_is_on = False
         self.x = 0.0
         self.y = 0.0
         self.z = 0.0
@@ -50,33 +47,6 @@ class HPGLPostProcessor:
 
     def emit(self, command: str):
         self.commands.append(command)
-
-    def pen_up(self):
-        if self.pen_is_down:
-            self.emit("PU;")
-            self.pen_is_down = False
-
-    def pen_down(self):
-        if not self.pen_is_down:
-            self.emit("PD;")
-            self.pen_is_down = True
-
-    def set_feed(self, feed_mm_per_min: float):
-        self.feed = feed_mm_per_min
-        command = f"VS{self.feed_to_m_per_s(feed_mm_per_min):.6f};"
-        if command != self.current_feed_command:
-            self.emit(command)
-            self.current_feed_command = command
-
-    def spindle_on(self):
-        if not self.spindle_is_on:
-            self.emit("!EM1;")
-            self.spindle_is_on = True
-
-    def spindle_off(self, force: bool = False):
-        if force or self.spindle_is_on:
-            self.emit("!EM0;")
-            self.spindle_is_on = False
 
     def translate(self, ir: list[Any]) -> str:
         self.emit("IN;")
@@ -98,7 +68,8 @@ class HPGLPostProcessor:
             pass
 
         elif isinstance(item, SetFeed):
-            self.set_feed(item.feed)
+            self.feed = item.feed
+            self.emit(f"VS{self.feed_to_m_per_s(item.feed):.6f};")
 
         elif isinstance(item, SetSpindleSpeed):
             self.spindle_speed = item.speed
@@ -106,22 +77,20 @@ class HPGLPostProcessor:
             self.emit(f"!RM{rpm_thousands};")
 
         elif isinstance(item, SpindleOn):
-            if not item.clockwise:
-                raise RuntimeError("M4 counterclockwise spindle is not supported by this LPKF profile.")
-            self.spindle_on()
+            self.emit("!EM1;")
 
         elif isinstance(item, SpindleOff):
-            self.spindle_off()
+            self.emit("!EM0;")
 
         elif isinstance(item, RapidMove):
-            self.pen_up()
+            self.emit("PU;")
             self.emit_ta(item.x, item.y, item.z)
             self.set_pos(item.x, item.y, item.z)
 
         elif isinstance(item, LinearMove):
             if item.feed is not None:
-                self.set_feed(item.feed)
-            self.pen_down()
+                self.emit(f"VS{self.feed_to_m_per_s(item.feed):.6f};")
+            self.emit("PD;")
             self.emit_ta(item.x, item.y, item.z)
             self.set_pos(item.x, item.y, item.z)
 
@@ -140,8 +109,8 @@ class HPGLPostProcessor:
             self.emit("!ST;")
 
         elif isinstance(item, ProgramEnd):
-            self.pen_up()
-            self.spindle_off(force=True)
+            self.emit("PU;")
+            self.emit("!EM0;")
 
         elif isinstance(item, SetTool):
             # G-code T word: selects tool, but does not physically change it!!!
@@ -151,8 +120,8 @@ class HPGLPostProcessor:
         elif isinstance(item, ChangeTool):
             # G-code M6: tool change
             # LPKF handling depends on your machine/workflow
-            self.pen_up()
-            self.spindle_off(force=True)
+            self.emit("PU;")
+            self.emit("!EM0;")
             if self.include_comments:
                 self.emit(f"/* Change tool to {item.tool} */")
 
@@ -183,7 +152,7 @@ class HPGLPostProcessor:
         cx = self.mm_to_steps(arc.center_x)
         cy = self.mm_to_steps(arc.center_y)
 
-        self.pen_down()
+        self.emit("PD;")
         self.emit(f"AA{cx},{cy},{angle:.6f};")
 
         if abs(arc.z - self.z) > 1e-9:
