@@ -1,6 +1,7 @@
 import math
 from typing import Any
 
+from lpkf_units import M60_STEP_MM, mm_to_m60_steps
 from translator.nist_interpreter import (
     RapidMove,
     LinearMove,
@@ -25,10 +26,13 @@ class HPGLPostProcessor:
     # Converts interpreter Intermediate Representation (IR) into LPKF HP-GL
 
     # Assumption:
-    ### The interpreter already converted inch input to mm
-    ### Coordinates are emitted in LPKF step units !!!!!!!!!
+    # The interpreter already converted inch input to mm.
+    # The M60 HP-GL increment is 6.35 mm / 800 steps (7.9375 um/step).
+    # Z is represented conceptually by PU/PD instead of a numeric coordinate.
 
-    STEP_MM = 0.0079375 # 7.9375 micrometers / step
+    PA_STEP_MM = M60_STEP_MM
+    SURFACE_Z = 0.0
+    EPS = 1e-6
 
     def __init__(self, include_comments: bool = False):
         self.commands: list[str] = []
@@ -37,10 +41,12 @@ class HPGLPostProcessor:
         self.y = 0.0
         self.z = 0.0
         self.feed = None
+        self.emitted_feed = None
         self.spindle_speed = 0.0
+        self.tool_down = False
 
-    def mm_to_steps(self, value: float) -> int:
-        return round(value / self.STEP_MM)
+    def mm_to_pa_units(self, value: float) -> int:
+        return mm_to_m60_steps(value)
 
     def feed_to_m_per_s(self, feed_mm_per_min: float) -> float:
         return feed_mm_per_min / 1000.0 / 60.0
@@ -49,6 +55,16 @@ class HPGLPostProcessor:
         self.commands.append(command)
 
     def translate(self, ir: list[Any]) -> str:
+        # A postprocessor instance can safely be reused for another job.
+        self.commands = []
+        self.x = 0.0
+        self.y = 0.0
+        self.z = 0.0
+        self.feed = None
+        self.emitted_feed = None
+        self.spindle_speed = 0.0
+        self.tool_down = False
+
         self.emit("IN;")
         self.emit("!CM1;")  # milling mode
         self.emit("PU;")
@@ -69,7 +85,7 @@ class HPGLPostProcessor:
 
         elif isinstance(item, SetFeed):
             self.feed = item.feed
-            self.emit(f"VS{self.feed_to_m_per_s(item.feed):.6f};")
+            self.emit_feed_if_changed(item.feed)
 
         elif isinstance(item, SetSpindleSpeed):
             self.spindle_speed = item.speed
@@ -83,18 +99,25 @@ class HPGLPostProcessor:
             self.emit("!EM0;")
 
         elif isinstance(item, RapidMove):
-            self.emit("PU;")
-            self.emit_ta(item.x, item.y, item.z)
+            if self.is_cutting_z(item.z):
+                raise RuntimeError("Rapid move requested below the cutting surface")
+
+            self.reject_ramped_move(item.x, item.y, item.z, "Rapid")
+            self.emit_tool_state(False)
+            self.emit_xy_if_changed(item.x, item.y)
             self.set_pos(item.x, item.y, item.z)
 
         elif isinstance(item, LinearMove):
-            if item.feed is not None:
-                self.emit(f"VS{self.feed_to_m_per_s(item.feed):.6f};")
-            self.emit("PD;")
-            self.emit_ta(item.x, item.y, item.z)
+            self.reject_ramped_move(item.x, item.y, item.z, "Linear")
+            self.emit_feed_if_changed(item.feed)
+            self.emit_tool_state(self.is_cutting_z(item.z))
+            self.emit_xy_if_changed(item.x, item.y)
             self.set_pos(item.x, item.y, item.z)
 
         elif isinstance(item, ArcMove):
+            self.reject_ramped_move(item.x, item.y, item.z, "Arc")
+            self.emit_feed_if_changed(item.feed)
+            self.emit_tool_state(self.is_cutting_z(item.z))
             self.emit_arc(item)
             self.set_pos(item.x, item.y, item.z)
 
@@ -109,7 +132,7 @@ class HPGLPostProcessor:
             self.emit("!ST;")
 
         elif isinstance(item, ProgramEnd):
-            self.emit("PU;")
+            self.emit_tool_state(False)
             self.emit("!EM0;")
 
         elif isinstance(item, SetTool):
@@ -120,7 +143,7 @@ class HPGLPostProcessor:
         elif isinstance(item, ChangeTool):
             # G-code M6: tool change
             # LPKF handling depends on your machine/workflow
-            self.emit("PU;")
+            self.emit_tool_state(False)
             self.emit("!EM0;")
             if self.include_comments:
                 self.emit(f"/* Change tool to {item.tool} */")
@@ -128,11 +151,48 @@ class HPGLPostProcessor:
         else:
             raise RuntimeError(f"Unsupported IR command: {item}")
 
-    def emit_ta(self, x: float, y: float, z: float):
-        xs = self.mm_to_steps(x)
-        ys = self.mm_to_steps(y)
-        zs = self.mm_to_steps(z)
-        self.emit(f"!TA{xs},{ys},{zs};")
+    def is_cutting_z(self, z: float) -> bool:
+        return z < self.SURFACE_Z - self.EPS
+
+    def emit_feed_if_changed(self, feed: float | None):
+        if feed is None:
+            return
+
+        if self.emitted_feed is None or not math.isclose(
+            feed, self.emitted_feed, abs_tol=self.EPS
+        ):
+            self.emit(f"VS{self.feed_to_m_per_s(feed):.6f};")
+            self.emitted_feed = feed
+
+    def emit_tool_state(self, tool_down: bool):
+        if tool_down == self.tool_down:
+            return
+
+        self.emit("PD;" if tool_down else "PU;")
+        self.tool_down = tool_down
+
+    def emit_xy_if_changed(self, x: float, y: float):
+        if math.isclose(x, self.x, abs_tol=self.EPS) and math.isclose(
+            y, self.y, abs_tol=self.EPS
+        ):
+            return
+
+        xs = self.mm_to_pa_units(x)
+        ys = self.mm_to_pa_units(y)
+        self.emit(f"PA{xs},{ys};")
+
+    def reject_ramped_move(self, x: float, y: float, z: float, move_name: str):
+        xy_changed = not (
+            math.isclose(x, self.x, abs_tol=self.EPS)
+            and math.isclose(y, self.y, abs_tol=self.EPS)
+        )
+        z_changed = not math.isclose(z, self.z, abs_tol=self.EPS)
+
+        if xy_changed and z_changed:
+            raise RuntimeError(
+                f"{move_name} move changes XY and Z simultaneously; "
+                "conceptual PU/PD output cannot represent a ramped move"
+            )
 
     def emit_arc(self, arc: ArcMove):
         if arc.plane != "XY":
@@ -149,14 +209,10 @@ class HPGLPostProcessor:
             rotation=arc.rotation,
         )
 
-        cx = self.mm_to_steps(arc.center_x)
-        cy = self.mm_to_steps(arc.center_y)
+        cx = self.mm_to_pa_units(arc.center_x)
+        cy = self.mm_to_pa_units(arc.center_y)
 
-        self.emit("PD;")
         self.emit(f"AA{cx},{cy},{angle:.6f};")
-
-        if abs(arc.z - self.z) > 1e-9:
-            self.emit(f"!ZA{self.mm_to_steps(arc.z)};")
 
     def arc_sweep_degrees(
             self,

@@ -31,6 +31,7 @@ from typing import Optional
 
 import serial
 import serial.tools.list_ports
+from lpkf_config import HardClipLimits, LPKFIni, OperatingWindow, XYPosition, format_number
 from translator.hpgl_postprocessor import HPGLPostProcessor
 from translator.nist_interpreter import NistInterpreter
 from translator.nist_parser import NistParser
@@ -41,6 +42,8 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -52,7 +55,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
-    #QSpinBox,
     QDoubleSpinBox,
     QVBoxLayout,
     QWidget,
@@ -77,7 +79,7 @@ class SerialWorker(QObject):
     log = Signal(str)
     line_received = Signal(str)
     position_received = Signal(float, float, float)
-    limits_received = Signal(float, float, float)
+    limits_received = Signal(float, float, float, float, float, float)
     status_received = Signal(str)
     streaming_progress = Signal(int, int)
     streaming_finished = Signal()
@@ -212,10 +214,10 @@ class SerialWorker(QObject):
             except ValueError:
                 pass
 
-        elif line.startswith("W") and len(nums) >= 3:
+        elif line.startswith("W") and len(nums) >= 6:
             try:
-                x, y, z = float(nums[0]), float(nums[1]), float(nums[2])
-                self.limits_received.emit(x, y, z)
+                values = [float(value) for value in nums[:6]]
+                self.limits_received.emit(*values)
             except ValueError:
                 pass
 
@@ -362,7 +364,7 @@ class MainWindow(QMainWindow):
 
         self.worker.connected.connect(self.on_connected)
         self.worker.disconnected.connect(self.on_disconnected)
-        self.worker.error.connect(self.show_error)
+        self.worker.error.connect(self.on_worker_error)
         self.worker.log.connect(self.append_log)
         self.worker.position_received.connect(self.update_position)
         self.worker.limits_received.connect(self.update_limits)
@@ -371,9 +373,26 @@ class MainWindow(QMainWindow):
         self.worker.streaming_finished.connect(self.on_stream_finished)
 
         self.hpgl_commands: list[str] = []
+        self.lpkf_ini = LPKFIni(Path(__file__).resolve().with_name("lpkf.ini"))
+        self.hardclip_limits: Optional[HardClipLimits] = None
+        self.operating_window: Optional[OperatingWindow] = None
+        self.streaming_active = False
+        self._ini_load_error: Optional[str] = None
+        try:
+            self.hardclip_limits = self.lpkf_ini.load_limits()
+            self.operating_window = self.lpkf_ini.load_window()
+            if self.hardclip_limits is not None and self.operating_window is not None:
+                self.operating_window.validate(self.hardclip_limits)
+        except Exception as exc:
+            self._ini_load_error = str(exc)
+            self.hardclip_limits = None
+            self.operating_window = None
+
         self._build_ui()
         self._build_menu()
         self.refresh_ports()
+        self.refresh_top_actions()
+        self.show_loaded_limits()
 
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(lambda: self.read_requested.emit())
@@ -393,6 +412,30 @@ class MainWindow(QMainWindow):
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
+
+        self.pause_action = QAction("PAUSE", self)
+        self.pause_action.triggered.connect(lambda: self.move_to_named_position("pause"))
+        self.default_home_action = QAction("DEFAULT HOME", self)
+        self.default_home_action.triggered.connect(
+            lambda: self.move_to_named_position("default_home")
+        )
+        self.calibrated_home_action = QAction("CALIBRATED HOME", self)
+        self.calibrated_home_action.triggered.connect(
+            lambda: self.move_to_named_position("calibrated_home")
+        )
+        self.zero_action = QAction("ZERO", self)
+        self.zero_action.triggered.connect(lambda: self.move_to_named_position("zero"))
+        self.iw_action = QAction("SET IW", self)
+        self.iw_action.triggered.connect(self.open_iw_dialog)
+
+        for action in (
+            self.pause_action,
+            self.default_home_action,
+            self.calibrated_home_action,
+            self.zero_action,
+            self.iw_action,
+        ):
+            self.menuBar().addAction(action)
 
     def _build_ui(self) :
         root = QWidget()
@@ -612,6 +655,136 @@ class MainWindow(QMainWindow):
     def step(self) -> int:
         return int(self.step_spin.value())
 
+    def refresh_top_actions(self) -> None:
+        if not hasattr(self, "pause_action"):
+            return
+
+        enabled = self.hardclip_limits is not None and not self.streaming_active
+        positions = self.hardclip_limits.positions() if self.hardclip_limits else {}
+        actions = {
+            "pause": self.pause_action,
+            "default_home": self.default_home_action,
+            "calibrated_home": self.calibrated_home_action,
+            "zero": self.zero_action,
+        }
+        for name, action in actions.items():
+            target = positions.get(name)
+            action.setEnabled(
+                enabled
+                and target is not None
+                and self.hardclip_limits is not None
+                and self.hardclip_limits.contains_xy(target)
+            )
+        self.iw_action.setEnabled(enabled)
+
+    def show_loaded_limits(self) -> None:
+        if self._ini_load_error:
+            self.show_error(f"Could not trust lpkf.ini: {self._ini_load_error}")
+            self.limits_label.setText("Limits: run OH;")
+            return
+        if self.hardclip_limits is None:
+            self.append_log("No lpkf.ini hardclip data. Run OH; before using position buttons.")
+            self.limits_label.setText("Limits: run OH;")
+            return
+
+        self.display_limits(self.hardclip_limits)
+        self.append_log(f"Loaded hardclip limits from {self.lpkf_ini.path.name}.")
+
+    def display_limits(self, limits: HardClipLimits) -> None:
+        self.limits_label.setText(
+            "Limits: "
+            f"X {format_number(limits.xmin)}..{format_number(limits.xmax)}, "
+            f"Y {format_number(limits.ymin)}..{format_number(limits.ymax)}, "
+            f"Z {format_number(limits.zmin)}..{format_number(limits.zmax)}"
+        )
+
+    def move_to_named_position(self, name: str) -> None:
+        if self.hardclip_limits is None:
+            self.show_error("Hardclip limits are unknown. Run OH; first.")
+            return
+
+        position = self.hardclip_limits.positions()[name]
+        if not self.hardclip_limits.contains_xy(position):
+            self.show_error(f"{name} is outside the hardclip limits.")
+            return
+
+        label = name.replace("_", " ").upper()
+        answer = QMessageBox.question(
+            self,
+            f"Move to {label}?",
+            f"Raise the pen and move to {label} at "
+            f"X={format_number(position.x)}, Y={format_number(position.y)}?",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        self.send_requested.emit(
+            f"PU;PA{format_number(position.x)},{format_number(position.y)};"
+        )
+
+    def open_iw_dialog(self) -> None:
+        if self.hardclip_limits is None:
+            self.show_error("Hardclip limits are unknown. Run OH; before setting IW.")
+            return
+
+        initial = self.operating_window or OperatingWindow(
+            self.hardclip_limits.xmin,
+            self.hardclip_limits.ymin,
+            self.hardclip_limits.xmax,
+            self.hardclip_limits.ymax,
+        )
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Set IW operating window")
+        layout = QFormLayout(dialog)
+        fields: dict[str, QDoubleSpinBox] = {}
+        for label, value in (
+            ("Xmin", initial.xmin),
+            ("Ymin", initial.ymin),
+            ("Xmax", initial.xmax),
+            ("Ymax", initial.ymax),
+        ):
+            spin = QDoubleSpinBox()
+            spin.setRange(-2_000_000_000, 2_000_000_000)
+            spin.setDecimals(3)
+            spin.setValue(value)
+            fields[label] = spin
+            layout.addRow(label, spin)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        window = OperatingWindow(
+            xmin=fields["Xmin"].value(),
+            ymin=fields["Ymin"].value(),
+            xmax=fields["Xmax"].value(),
+            ymax=fields["Ymax"].value(),
+        )
+        try:
+            window.validate(self.hardclip_limits)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid IW window", str(exc))
+            return
+
+        command = (
+            f"IW{format_number(window.xmin)},{format_number(window.ymin)},"
+            f"{format_number(window.xmax)},{format_number(window.ymax)};"
+        )
+        self.send_requested.emit(command)
+        self.operating_window = window
+        try:
+            self.lpkf_ini.save_window(window)
+            self.append_log(f"Saved IW operating window to {self.lpkf_ini.path.name}.")
+        except Exception as exc:
+            self.show_error(f"Could not save IW operating window: {exc}")
+
     def refresh_ports(self):
         current = self.port_combo.currentText()
         self.port_combo.clear()
@@ -651,6 +824,12 @@ class MainWindow(QMainWindow):
     def show_error(self, text: str):
         self.append_log(f"ERROR: {text}")
 
+    def on_worker_error(self, text: str):
+        if self.streaming_active:
+            self.streaming_active = False
+            self.refresh_top_actions()
+        self.show_error(text)
+
     def update_position(self, x: float, y: float, z: float):
         self.x_label.setText(f"X: {x:g}")
         self.y_label.setText(f"Y: {y:g}")
@@ -658,8 +837,27 @@ class MainWindow(QMainWindow):
         # because spindle motion tool is up/down only
         self.z_label.setText("Z: —")
 
-    def update_limits(self, x: float, y: float, z: float):
-        self.limits_label.setText(f"Limits: X {x:g}, Y {y:g}, Z {z:g}")
+    def update_limits(
+        self,
+        xmin: float,
+        ymin: float,
+        zmin: float,
+        xmax: float,
+        ymax: float,
+        zmax: float,
+    ):
+        limits = HardClipLimits(xmin, ymin, zmin, xmax, ymax, zmax)
+        try:
+            limits.validate()
+            self.lpkf_ini.save_limits(limits)
+        except Exception as exc:
+            self.show_error(f"Could not save OH hardclip response: {exc}")
+            return
+
+        self.hardclip_limits = limits
+        self.display_limits(limits)
+        self.refresh_top_actions()
+        self.append_log(f"Saved OH hardclip response to {self.lpkf_ini.path.name}.")
 
     def update_machine_status(self, status: str):
         self.status_label.setText(f"Status: {status}")
@@ -668,6 +866,8 @@ class MainWindow(QMainWindow):
         self.progress_label.setText(f"File: {index}/{total} commands")
 
     def on_stream_finished(self) -> None:
+        self.streaming_active = False
+        self.refresh_top_actions()
         self.append_log("Streaming finished.")
         self.statusBar().showMessage("Streaming finished", 5000)
 
@@ -740,6 +940,8 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
 
+        self.streaming_active = True
+        self.refresh_top_actions()
         self.stream_requested.emit(
             self.hpgl_commands,
             float(self.stream_delay.value()),
@@ -763,4 +965,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
