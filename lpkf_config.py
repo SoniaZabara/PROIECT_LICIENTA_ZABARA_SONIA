@@ -40,13 +40,13 @@ class HardClipLimits:
     def positions(self) -> dict[str, XYPosition]:
         default_home = XYPosition(self.xmin, self.ymax / 2.0)
         return {
-            "pause": XYPosition(self.xmin, self.ymin),
+            "pause": XYPosition(self.xmax, self.ymax),
             "default_home": default_home,
             "calibrated_home": XYPosition(
                 default_home.x + CALIBRATED_HOME_OFFSET_UNITS,
                 default_home.y,
             ),
-            "zero": XYPosition(self.xmax, self.ymax),
+            "zero": XYPosition(self.xmin, self.ymin),
         }
 
 

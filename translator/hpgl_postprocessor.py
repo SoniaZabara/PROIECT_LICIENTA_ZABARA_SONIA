@@ -48,8 +48,8 @@ class HPGLPostProcessor:
     def mm_to_pa_units(self, value: float) -> int:
         return mm_to_m60_steps(value)
 
-    def feed_to_m_per_s(self, feed_mm_per_min: float) -> float:
-        return feed_mm_per_min / 1000.0 / 60.0
+    def feed_to_um_per_s(self, feed_mm_per_min: float) -> float:
+        return feed_mm_per_min * 1000.0 / 60.0
 
     def emit(self, command: str):
         self.commands.append(command)
@@ -161,7 +161,7 @@ class HPGLPostProcessor:
         if self.emitted_feed is None or not math.isclose(
             feed, self.emitted_feed, abs_tol=self.EPS
         ):
-            self.emit(f"VS{self.feed_to_m_per_s(feed):.6f};")
+            self.emit(f"VS{self.feed_to_um_per_s(feed):.6f};")
             self.emitted_feed = feed
 
     def emit_tool_state(self, tool_down: bool):
