@@ -31,7 +31,14 @@ from typing import Optional
 
 import serial
 import serial.tools.list_ports
-from lpkf_config import HardClipLimits, LPKFIni, OperatingWindow, XYPosition, format_number
+from lpkf_config import (
+    HardClipLimits,
+    LPKFIni,
+    OperatingWindow,
+    XYPosition,
+    format_number,
+    hardclip_from_oh_values,
+)
 from translator.hpgl_postprocessor import HPGLPostProcessor
 from translator.nist_interpreter import NistInterpreter
 from translator.nist_parser import NistParser
@@ -214,10 +221,17 @@ class SerialWorker(QObject):
             except ValueError:
                 pass
 
-        elif line.startswith("W") and len(nums) >= 6:
+        elif line.startswith("W") and len(nums) >= 3:
             try:
-                values = [float(value) for value in nums[:6]]
-                self.limits_received.emit(*values)
+                limits = hardclip_from_oh_values([float(value) for value in nums])
+                self.limits_received.emit(
+                    limits.xmin,
+                    limits.ymin,
+                    limits.zmin,
+                    limits.xmax,
+                    limits.ymax,
+                    limits.zmax,
+                )
             except ValueError:
                 pass
 

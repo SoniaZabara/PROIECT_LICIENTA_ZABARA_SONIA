@@ -50,6 +50,19 @@ class HardClipLimits:
         }
 
 
+def hardclip_from_oh_values(values: list[float]) -> HardClipLimits:
+    if len(values) >= 6:
+        limits = HardClipLimits(*values[:6])
+    elif len(values) >= 3:
+        xmax, ymax, zmax = values[:3]
+        limits = HardClipLimits(0.0, 0.0, 0.0, xmax, ymax, zmax)
+    else:
+        raise ValueError("OH response must contain either three or six coordinates")
+
+    limits.validate()
+    return limits
+
+
 @dataclass(frozen=True)
 class OperatingWindow:
     xmin: float
