@@ -2,10 +2,12 @@ import configparser
 from dataclasses import dataclass
 from pathlib import Path
 
-from lpkf_units import mm_to_m60_steps
+from lpkf_units import mm_to_m60_steps, round_half_away_from_zero
 
 CALIBRATED_HOME_OFFSET_MM = 30.0
 CALIBRATED_HOME_OFFSET_UNITS = mm_to_m60_steps(CALIBRATED_HOME_OFFSET_MM)
+PAUSE_LIMIT_MARGIN_MM = 5.0
+PAUSE_LIMIT_MARGIN_UNITS = mm_to_m60_steps(PAUSE_LIMIT_MARGIN_MM)
 
 
 @dataclass(frozen=True)
@@ -37,16 +39,36 @@ class HardClipLimits:
             and self.ymin <= position.y <= self.ymax
         )
 
-    def positions(self) -> dict[str, XYPosition]:
-        default_home = XYPosition(self.xmin, self.ymax / 2.0)
+    def positions(
+        self,
+        pause_margin_units: int = PAUSE_LIMIT_MARGIN_UNITS,
+    ) -> dict[str, XYPosition]:
+        if pause_margin_units < 0:
+            raise ValueError("PAUSE limit margin must not be negative")
+        xmin = round_half_away_from_zero(self.xmin)
+        ymin = round_half_away_from_zero(self.ymin)
+        xmax = round_half_away_from_zero(self.xmax)
+        ymax = round_half_away_from_zero(self.ymax)
+        default_home = XYPosition(
+            xmin,
+            round_half_away_from_zero(self.ymax / 2.0),
+        )
         return {
-            "pause": XYPosition(self.xmax, self.ymax),
+            "pause": XYPosition(
+                max(xmin, xmax - pause_margin_units),
+                max(ymin, ymax - pause_margin_units),
+            ),
             "default_home": default_home,
             "calibrated_home": XYPosition(
-                default_home.x + CALIBRATED_HOME_OFFSET_UNITS,
+                round_half_away_from_zero(
+                    default_home.x + CALIBRATED_HOME_OFFSET_UNITS
+                ),
                 default_home.y,
             ),
-            "zero": XYPosition(self.xmin, self.ymin),
+            "zero": XYPosition(
+                xmin,
+                ymin,
+            ),
         }
 
 
@@ -101,9 +123,33 @@ class LPKFIni:
         limits.validate()
         return limits
 
+    def load_position(self, name: str) -> XYPosition | None:
+        parser = self._read()
+        x_key = f"{name}_x"
+        y_key = f"{name}_y"
+        if not (
+            parser.has_section("positions")
+            and parser.has_option("positions", x_key)
+            and parser.has_option("positions", y_key)
+        ):
+            return None
+
+        return XYPosition(
+            x=round_half_away_from_zero(parser.getfloat("positions", x_key)),
+            y=round_half_away_from_zero(parser.getfloat("positions", y_key)),
+        )
+
     def save_limits(self, limits: HardClipLimits) -> None:
         limits.validate()
         parser = self._read()
+        pause_margin_mm = parser.getfloat(
+            "positions",
+            "pause_limit_margin_mm",
+            fallback=PAUSE_LIMIT_MARGIN_MM,
+        )
+        if pause_margin_mm < 0:
+            raise ValueError("PAUSE limit margin must not be negative")
+        pause_margin_units = mm_to_m60_steps(pause_margin_mm)
         parser["hardclip"] = {
             "xmin": format_number(limits.xmin),
             "ymin": format_number(limits.ymin),
@@ -115,13 +161,25 @@ class LPKFIni:
 
         parser["positions"] = {
             f"{name}_{axis}": format_number(getattr(position, axis))
-            for name, position in limits.positions().items()
+            for name, position in limits.positions(pause_margin_units).items()
             for axis in ("x", "y")
         }
         parser["positions"]["calibrated_home_offset_mm"] = format_number(
             CALIBRATED_HOME_OFFSET_MM
         )
+        parser["positions"]["pause_limit_margin_mm"] = format_number(pause_margin_mm)
         self._write(parser)
+
+    def load_pause_margin_units(self) -> int:
+        parser = self._read()
+        margin_mm = parser.getfloat(
+            "positions",
+            "pause_limit_margin_mm",
+            fallback=PAUSE_LIMIT_MARGIN_MM,
+        )
+        if margin_mm < 0:
+            raise ValueError("PAUSE limit margin must not be negative")
+        return mm_to_m60_steps(margin_mm)
 
     def load_window(self) -> OperatingWindow | None:
         parser = self._read()
@@ -157,3 +215,8 @@ class LPKFIni:
 
 def format_number(value: float) -> str:
     return f"{value:g}"
+
+
+def format_step(value: float) -> str:
+    """Format an M60 coordinate as a whole machine-step count."""
+    return str(round_half_away_from_zero(value))

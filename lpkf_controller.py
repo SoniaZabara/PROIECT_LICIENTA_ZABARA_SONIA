@@ -37,6 +37,7 @@ from lpkf_config import (
     OperatingWindow,
     XYPosition,
     format_number,
+    format_step,
     hardclip_from_oh_values,
 )
 from translator.hpgl_postprocessor import HPGLPostProcessor
@@ -97,6 +98,7 @@ class SerialWorker(QObject):
         self._streaming = False
         self._stop_streaming = False
         self._rx_buffer = ""
+        self._last_machine_error: str | None = None
 
     @Slot(object)
     def connect_port(self, cfg: SerialConfig):
@@ -150,10 +152,7 @@ class SerialWorker(QObject):
             command += ";"
 
         try:
-            payload = command.encode("ascii", errors="ignore")
-            self.ser.write(payload)
-            self.ser.flush()
-            self.log.emit(f">> {command}")
+            self._write_command(command)
             time.sleep(0.05)
             self._read_available()
         except Exception as exc:
@@ -168,9 +167,19 @@ class SerialWorker(QObject):
         if not line:
             return False
 
+        # IN may return the single-character reset response Z without a
+        # terminator. If !CT1 follows immediately, its C acknowledgement can
+        # arrive in the same serial frame as "ZC".
+        if line == "ZC":
+            self._handle_received_line("Z")
+            return self._handle_received_line("C")
+
         self.log.emit(f"<< {line}")
         if line == "C":
             return True
+
+        if re.fullmatch(r"E\d+", line, flags=re.IGNORECASE):
+            self._last_machine_error = line.upper()
 
         self.line_received.emit(line)
         self._parse_machine_response(line)
@@ -202,6 +211,9 @@ class SerialWorker(QObject):
 
         if self._rx_buffer.strip() == "C":
             acknowledged = self._handle_received_line(self._rx_buffer) or acknowledged
+            self._rx_buffer = ""
+        elif self._rx_buffer.strip() == "Z":
+            self._handle_received_line(self._rx_buffer)
             self._rx_buffer = ""
 
         return acknowledged
@@ -246,6 +258,12 @@ class SerialWorker(QObject):
 
     def _write_command(self, command: str) -> str:
         command = self._normalize_command(command)
+        for part in re.split(r"[;:]", command):
+            if part.strip().upper() in {"PA", "PR"}:
+                raise ValueError(
+                    f"{part.strip().upper()} requires at least one X,Y coordinate pair; "
+                    "use PAx,y for an absolute move or PRdx,dy for a relative move."
+                )
         self.ser.write(command.encode("ascii", errors="ignore"))
         self.ser.flush()
         self.log.emit(f">> {command}")
@@ -256,23 +274,30 @@ class SerialWorker(QObject):
         while time.time() < deadline:
             if self._stop_streaming:
                 raise RuntimeError("Streaming interrupted by user.")
-            if self._read_lines_until(min(time.time() + 0.1, deadline)):
+            acknowledged = self._read_lines_until(min(time.time() + 0.1, deadline))
+            if self._last_machine_error is not None:
+                raise RuntimeError(
+                    f"Machine returned {self._last_machine_error} for {command}"
+                )
+            if acknowledged:
                 return
 
         raise TimeoutError(f"No C acknowledgement received for {command}")
 
     def _send_and_wait_ack(self, command: str, timeout_s: float) -> str:
+        self._last_machine_error = None
         sent = self._write_command(command)
         self._wait_for_ack(sent, timeout_s)
         return sent
 
-    @Slot(list, float, bool, float)
+    @Slot(list, float, bool, float, str)
     def stream_commands(
         self,
         commands: list[str],
         delay_s: float = 0.02,
         wait_for_ack: bool = True,
         ack_timeout_s: float = 30.0,
+        iw_command: str = "",
     ):
         if not self._ensure_connected():
             return
@@ -283,15 +308,11 @@ class SerialWorker(QObject):
         self._streaming = True
         self._stop_streaming = False
         total = len(commands)
+        iw_command = self._normalize_command(iw_command)
 
         echo_enabled = False
 
         try:
-            if wait_for_ack:
-                self.log.emit("Enabling echo acknowledgement mode with !CT1;")
-                self._send_and_wait_ack("!CT1;", ack_timeout_s)
-                echo_enabled = True
-
             for index, command in enumerate(commands, start=1):
                 if self._stop_streaming:
                     self.log.emit("Streaming interrupted by user.")
@@ -300,12 +321,40 @@ class SerialWorker(QObject):
                 command = self._normalize_command(command)
                 if not command:
                     continue
+                is_initialize = command.upper() == "IN;"
+                if is_initialize and not iw_command:
+                    raise RuntimeError(
+                        "IN resets the input window, but no IW command "
+                        "was supplied for restoration."
+                    )
 
                 if wait_for_ack:
-                    self._send_and_wait_ack(command, ack_timeout_s)
+                    if is_initialize:
+                        # IN restores defaults, including non-echo mode. Do
+                        # not wait for a C that the reset will never produce.
+                        self._write_command(command)
+                        self._read_available()
+                        echo_enabled = False
+
+                    if not echo_enabled:
+                        self.log.emit(
+                            "Enabling echo acknowledgement mode with !CT1;"
+                        )
+                        self._send_and_wait_ack("!CT1;", ack_timeout_s)
+                        echo_enabled = True
+
+                    if not is_initialize:
+                        self._send_and_wait_ack(command, ack_timeout_s)
+                    elif iw_command:
+                        self.log.emit(f"Restoring input window with {iw_command}")
+                        self._send_and_wait_ack(iw_command, ack_timeout_s)
                 else:
                     self._write_command(command)
                     self._read_available()
+                    if is_initialize:
+                        self.log.emit(f"Restoring input window with {iw_command}")
+                        self._write_command(iw_command)
+                        self._read_available()
                     time.sleep(delay_s)
 
                 self.streaming_progress.emit(index, total)
@@ -335,7 +384,10 @@ def split_hpgl_commands(text: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
-def translate_gcode_to_hpgl(path: Path) -> str:
+def translate_gcode_to_hpgl(
+    path: Path,
+    work_origin_steps: tuple[float, float] | None = None,
+) -> str:
     parser = NistParser()
     parse_tree = parser.parse(input_path=str(path))
 
@@ -345,7 +397,7 @@ def translate_gcode_to_hpgl(path: Path) -> str:
     interpreter = NistInterpreter()
     ir = interpreter.interpret(ast_tree)
 
-    post = HPGLPostProcessor()
+    post = HPGLPostProcessor(work_origin_steps=work_origin_steps)
     return post.translate(ir)
 
 class MainWindow(QMainWindow):
@@ -353,7 +405,7 @@ class MainWindow(QMainWindow):
     disconnect_requested = Signal()
     send_requested = Signal(str)
     read_requested = Signal()
-    stream_requested = Signal(list, float, bool, float)
+    stream_requested = Signal(list, float, bool, float, str)
     stop_stream_requested = Signal()
 
     def __init__(self):
@@ -642,8 +694,16 @@ class MainWindow(QMainWindow):
         stream_btn.clicked.connect(self.stream_file)
         stop_stream_btn = QPushButton("Stop streaming")
         stop_stream_btn.clicked.connect(lambda: self.stop_stream_requested.emit())
+        self.apply_home_offset = QCheckBox("Apply calibrated HOME offset")
+        self.apply_home_offset.setChecked(True)
+        self.apply_home_offset.setToolTip(
+            "When enabled, G-code X0/Y0 is translated to calibrated HOME. "
+            "When disabled, G-code coordinates are relative to machine ZERO. "
+            "This setting is applied when a G-code file is loaded."
+        )
         file_buttons.addWidget(load_gcode_btn)
         file_buttons.addWidget(load_btn)
+        file_buttons.addWidget(self.apply_home_offset)
         file_buttons.addWidget(self.ack_streaming)
         file_buttons.addWidget(self.ack_timeout)
         file_buttons.addWidget(self.stream_delay)
@@ -674,7 +734,14 @@ class MainWindow(QMainWindow):
             return
 
         enabled = self.hardclip_limits is not None and not self.streaming_active
-        positions = self.hardclip_limits.positions() if self.hardclip_limits else {}
+        positions = (
+            self.hardclip_limits.positions(self.lpkf_ini.load_pause_margin_units())
+            if self.hardclip_limits
+            else {}
+        )
+        configured_home = self.lpkf_ini.load_position("calibrated_home")
+        if configured_home is not None:
+            positions["calibrated_home"] = configured_home
         actions = {
             "pause": self.pause_action,
             "default_home": self.default_home_action,
@@ -717,7 +784,11 @@ class MainWindow(QMainWindow):
             self.show_error("Hardclip limits are unknown. Run OH; first.")
             return
 
-        position = self.hardclip_limits.positions()[name]
+        position = self.hardclip_limits.positions(
+            self.lpkf_ini.load_pause_margin_units()
+        )[name]
+        if name == "calibrated_home":
+            position = self.lpkf_ini.load_position(name) or position
         if not self.hardclip_limits.contains_xy(position):
             self.show_error(f"{name} is outside the hardclip limits.")
             return
@@ -733,7 +804,7 @@ class MainWindow(QMainWindow):
             return
 
         self.send_requested.emit(
-            f"PU;PA{format_number(position.x)},{format_number(position.y)};"
+            f"PU;PA{format_step(position.x)},{format_step(position.y)};"
         )
 
     def open_iw_dialog(self) -> None:
@@ -776,10 +847,10 @@ class MainWindow(QMainWindow):
             return
 
         window = OperatingWindow(
-            xmin=fields["Xmin"].value(),
-            ymin=fields["Ymin"].value(),
-            xmax=fields["Xmax"].value(),
-            ymax=fields["Ymax"].value(),
+            xmin=float(format_step(fields["Xmin"].value())),
+            ymin=float(format_step(fields["Ymin"].value())),
+            xmax=float(format_step(fields["Xmax"].value())),
+            ymax=float(format_step(fields["Ymax"].value())),
         )
         try:
             window.validate(self.hardclip_limits)
@@ -788,8 +859,8 @@ class MainWindow(QMainWindow):
             return
 
         command = (
-            f"IW{format_number(window.xmin)},{format_number(window.ymin)},"
-            f"{format_number(window.xmax)},{format_number(window.ymax)};"
+            f"IW{format_step(window.xmin)},{format_step(window.ymin)},"
+            f"{format_step(window.xmax)},{format_step(window.ymax)};"
         )
         self.send_requested.emit(command)
         self.operating_window = window
@@ -932,11 +1003,46 @@ class MainWindow(QMainWindow):
 
         path = Path(path_str)
         try:
-            hpgl = translate_gcode_to_hpgl(path)
+            work_origin: tuple[float, float] | None = None
+            origin_description = "machine ZERO"
+
+            if self.apply_home_offset.isChecked():
+                home = self.lpkf_ini.load_position("calibrated_home")
+                if home is None:
+                    raise RuntimeError(
+                        "Calibrated HOME is not configured in lpkf.ini. "
+                        "Store the measured HOME before translating a job."
+                    )
+                if self.hardclip_limits is None:
+                    raise RuntimeError("Hardclip limits are unknown. Run OH before translating a job.")
+                if not self.hardclip_limits.contains_xy(home):
+                    raise RuntimeError("Configured calibrated HOME is outside the hardclip limits.")
+
+                work_origin = (home.x, home.y)
+                origin_description = f"HOME X={home.x:g}, Y={home.y:g}"
+            else:
+                answer = QMessageBox.warning(
+                    self,
+                    "HOME offset disabled",
+                    "The translated job will use machine ZERO as G-code X0/Y0.\n\n"
+                    "Continue only if this is intentional.",
+                    QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Cancel,
+                )
+                if answer != QMessageBox.StandardButton.Ok:
+                    return
+                self.append_log(
+                    "WARNING: Translating G-code without the calibrated HOME offset."
+                )
+
+            hpgl = translate_gcode_to_hpgl(path, work_origin)
             self.hpgl_commands = split_hpgl_commands(hpgl)
             self.preview.setPlainText(";\n".join(self.hpgl_commands) + (";" if self.hpgl_commands else ""))
             self.progress_label.setText(f"File: {len(self.hpgl_commands)} translated commands")
-            self.append_log(f"Translated {path.name}: {len(self.hpgl_commands)} HP-GL commands.")
+            self.append_log(
+                f"Translated {path.name} from {origin_description}: "
+                f"{len(self.hpgl_commands)} HP-GL commands."
+            )
         except Exception as exc:
             self.show_error(f"Could not translate G-code file: {exc}")
 
@@ -944,6 +1050,39 @@ class MainWindow(QMainWindow):
         if not self.hpgl_commands:
             self.show_error("No HP-GL job loaded.")
             return
+
+        contains_initialize = any(
+            command.strip().rstrip(";:").upper() == "IN"
+            for command in self.hpgl_commands
+        )
+        iw_command = ""
+        if contains_initialize:
+            window = self.operating_window
+            if window is None:
+                if self.hardclip_limits is None:
+                    self.show_error(
+                        "No operating window is configured. Run OH or configure "
+                        "IW before streaming a file containing IN."
+                    )
+                    return
+                window = OperatingWindow(
+                    self.hardclip_limits.xmin,
+                    self.hardclip_limits.ymin,
+                    self.hardclip_limits.xmax,
+                    self.hardclip_limits.ymax,
+                )
+
+            try:
+                if self.hardclip_limits is not None:
+                    window.validate(self.hardclip_limits)
+            except ValueError as exc:
+                self.show_error(f"Cannot restore IW before streaming: {exc}")
+                return
+
+            iw_command = (
+                f"IW{format_step(window.xmin)},{format_step(window.ymin)},"
+                f"{format_step(window.xmax)},{format_step(window.ymax)};"
+            )
 
         answer = QMessageBox.question(
             self,
@@ -961,6 +1100,7 @@ class MainWindow(QMainWindow):
             float(self.stream_delay.value()),
             self.ack_streaming.isChecked(),
             float(self.ack_timeout.value()),
+            iw_command,
         )
 
     def closeEvent(self, event) -> None:  # type: ignore[override]

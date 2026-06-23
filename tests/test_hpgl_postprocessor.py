@@ -1,7 +1,7 @@
 import unittest
 
 from translator.hpgl_postprocessor import HPGLPostProcessor
-from translator.nist_interpreter import LinearMove, RapidMove, SetFeed
+from translator.nist_interpreter import ArcMove, LinearMove, RapidMove, SetFeed
 
 
 class HPGLPostProcessorTests(unittest.TestCase):
@@ -45,7 +45,7 @@ class HPGLPostProcessorTests(unittest.TestCase):
 
         self.assertEqual(
             [command for command in commands if command.startswith("VS")],
-            ["VS0.002000", "VS0.001000"],
+            ["VS2000", "VS1000"],
         )
 
     def test_rapid_move_below_surface_is_rejected(self):
@@ -65,6 +65,80 @@ class HPGLPostProcessorTests(unittest.TestCase):
         second = post.translate(moves)
 
         self.assertEqual(first, second)
+
+    def test_work_origin_offsets_absolute_moves_in_machine_steps(self):
+        output = HPGLPostProcessor(work_origin_steps=(3780, 24000)).translate(
+            [
+                RapidMove(0.0, 0.0, 2.0),
+                RapidMove(10.0, 5.0, 2.0),
+            ]
+        )
+        commands = [command.strip() for command in output.split(";") if command.strip()]
+
+        self.assertEqual(
+            [command for command in commands if command.startswith("PA")],
+            ["PA3780,24000", "PA5040,24630"],
+        )
+
+    def test_missing_work_origin_preserves_machine_zero_coordinates(self):
+        output = HPGLPostProcessor(work_origin_steps=None).translate(
+            [
+                RapidMove(0.0, 0.0, 2.0),
+                RapidMove(10.0, 5.0, 2.0),
+            ]
+        )
+        commands = [command.strip() for command in output.split(";") if command.strip()]
+
+        self.assertEqual(
+            [command for command in commands if command.startswith("PA")],
+            ["PA1260,630"],
+        )
+
+    def test_work_origin_is_applied_to_arc_center(self):
+        arc = ArcMove(
+            clockwise=False,
+            plane="XY",
+            x=20.0,
+            y=10.0,
+            z=2.0,
+            center_x=10.0,
+            center_y=10.0,
+            center_z=2.0,
+            rotation=1,
+            feed=120.0,
+        )
+        output = HPGLPostProcessor(work_origin_steps=(3780, 24000)).translate(
+            [RapidMove(0.0, 0.0, 2.0), RapidMove(10.0, 0.0, 2.0), arc]
+        )
+        commands = [command.strip() for command in output.split(";") if command.strip()]
+
+        self.assertIn("AA5040,25260,90", commands)
+
+    def test_generated_hpgl_numeric_parameters_are_whole_numbers(self):
+        arc = ArcMove(
+            clockwise=True,
+            plane="XY",
+            x=4.0,
+            y=3.0,
+            z=-1.0,
+            center_x=2.0,
+            center_y=2.0,
+            center_z=-1.0,
+            rotation=1,
+            feed=20.0,
+        )
+
+        output = HPGLPostProcessor().translate(
+            [
+                SetFeed(20.0),
+                RapidMove(0.0, 0.0, 1.0),
+                RapidMove(1.0, 1.0, 1.0),
+                LinearMove(1.0, 1.0, -1.0, 20.0),
+                arc,
+            ]
+        )
+
+        self.assertNotRegex(output, r"\d+\.\d+")
 
 
 if __name__ == "__main__":

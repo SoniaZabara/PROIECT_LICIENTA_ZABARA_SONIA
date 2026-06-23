@@ -1,7 +1,11 @@
 import math
 from typing import Any
 
-from lpkf_units import M60_STEP_MM, mm_to_m60_steps
+from lpkf_units import (
+    M60_STEP_MM,
+    mm_to_m60_steps,
+    round_half_away_from_zero,
+)
 from translator.nist_interpreter import (
     RapidMove,
     LinearMove,
@@ -34,9 +38,14 @@ class HPGLPostProcessor:
     SURFACE_Z = 0.0
     EPS = 1e-6
 
-    def __init__(self, include_comments: bool = False):
+    def __init__(
+        self,
+        include_comments: bool = False,
+        work_origin_steps: tuple[float, float] | None = None,
+    ):
         self.commands: list[str] = []
         self.include_comments = include_comments
+        self.work_origin_steps = work_origin_steps
         self.x = 0.0
         self.y = 0.0
         self.z = 0.0
@@ -68,6 +77,12 @@ class HPGLPostProcessor:
         self.emit("IN;")
         self.emit("!CM1;")  # milling mode
         self.emit("PU;")
+        if self.work_origin_steps is not None:
+            # G-code X0/Y0 is the BoardMaster-style HOME/work origin, not
+            # the machine's absolute zero. Establish that position before
+            # processing Z-only moves that could lower the tool.
+            xs, ys = self.xy_to_pa_units(0.0, 0.0)
+            self.emit(f"PA{xs},{ys};")
 
         for item in ir:
             self.translate_item(item)
@@ -122,7 +137,7 @@ class HPGLPostProcessor:
             self.set_pos(item.x, item.y, item.z)
 
         elif isinstance(item, Dwell):
-            self.emit(f"!TW{round(item.seconds * 1000)};")
+            self.emit(f"!TW{round_half_away_from_zero(item.seconds * 1000)};")
 
         elif isinstance(item, (CoolantMistOn, CoolantFloodOn, CoolantOff)):
             # LPKF command depends on hardware wiring, so this not apply for our model
@@ -161,7 +176,8 @@ class HPGLPostProcessor:
         if self.emitted_feed is None or not math.isclose(
             feed, self.emitted_feed, abs_tol=self.EPS
         ):
-            self.emit(f"VS{self.feed_to_um_per_s(feed):.6f};")
+            speed = round_half_away_from_zero(self.feed_to_um_per_s(feed))
+            self.emit(f"VS{speed};")
             self.emitted_feed = feed
 
     def emit_tool_state(self, tool_down: bool):
@@ -177,9 +193,15 @@ class HPGLPostProcessor:
         ):
             return
 
-        xs = self.mm_to_pa_units(x)
-        ys = self.mm_to_pa_units(y)
+        xs, ys = self.xy_to_pa_units(x, y)
         self.emit(f"PA{xs},{ys};")
+
+    def xy_to_pa_units(self, x_mm: float, y_mm: float) -> tuple[int, int]:
+        origin_x, origin_y = self.work_origin_steps or (0.0, 0.0)
+        return (
+            round_half_away_from_zero(origin_x + x_mm / self.PA_STEP_MM),
+            round_half_away_from_zero(origin_y + y_mm / self.PA_STEP_MM),
+        )
 
     def reject_ramped_move(self, x: float, y: float, z: float, move_name: str):
         xy_changed = not (
@@ -209,10 +231,17 @@ class HPGLPostProcessor:
             rotation=arc.rotation,
         )
 
-        cx = self.mm_to_pa_units(arc.center_x)
-        cy = self.mm_to_pa_units(arc.center_y)
+        cx, cy = self.xy_to_pa_units(arc.center_x, arc.center_y)
 
-        self.emit(f"AA{cx},{cy},{angle:.6f};")
+        integer_angle = round_half_away_from_zero(angle)
+        self.emit(f"AA{cx},{cy},{integer_angle};")
+
+        # Rounding an arc sweep can move the controller's endpoint slightly.
+        # Correct back to the exact quantized G-code endpoint so later moves
+        # start from the position tracked by the interpreter.
+        if not math.isclose(angle, integer_angle, abs_tol=self.EPS):
+            end_x, end_y = self.xy_to_pa_units(arc.x, arc.y)
+            self.emit(f"PA{end_x},{end_y};")
 
     def arc_sweep_degrees(
             self,
