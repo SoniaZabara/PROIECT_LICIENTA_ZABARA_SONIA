@@ -105,12 +105,17 @@ class HPGLPostProcessor:
         elif isinstance(item, SetSpindleSpeed):
             self.spindle_speed = item.speed
             rpm_thousands = max(0, min(60, round(item.speed / 1000)))
+            self.emit("!OC;") # requirest opening and closing channel....
             self.emit(f"!RM{rpm_thousands};")
+            self.emit("!CC;")
 
         elif isinstance(item, SpindleOn):
             self.emit("!EM1;")
 
         elif isinstance(item, SpindleOff):
+            self.emit("!OC;") # requirest opening and closing channel....
+            self.emit("!RM0;")
+            self.emit("!CC;")
             self.emit("!EM0;")
 
         elif isinstance(item, RapidMove):
