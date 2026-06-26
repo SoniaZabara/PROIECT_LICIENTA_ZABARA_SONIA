@@ -91,6 +91,11 @@ class SerialWorker(QObject):
     status_received = Signal(str)
     streaming_progress = Signal(int, int)
     streaming_finished = Signal()
+    streaming_stopped = Signal()
+    flow_status_changed = Signal(bool, bool, bool)
+
+    ACK_TIMEOUT_S = 30.0
+    CTS_TIMEOUT_S = 30.0
 
     def __init__(self):
         super().__init__()
@@ -99,10 +104,12 @@ class SerialWorker(QObject):
         self._stop_streaming = False
         self._rx_buffer = ""
         self._last_machine_error: str | None = None
+        self._last_flow_status: tuple[bool, bool, bool] | None = None
 
     @Slot(object)
     def connect_port(self, cfg: SerialConfig):
         try:
+            self._stop_streaming = False
             if self.ser and self.ser.is_open:
                 self.ser.close()
 
@@ -118,6 +125,7 @@ class SerialWorker(QObject):
                 write_timeout=cfg.write_timeout,
             )
             self.log.emit(f"Connected to {cfg.port} at {cfg.baudrate} baud")
+            self._emit_flow_status(force=True)
             self.connected.emit(cfg.port)
         except Exception as exc:
             self.error.emit(f"Could not open serial port: {exc}")
@@ -129,12 +137,14 @@ class SerialWorker(QObject):
             if self.ser and self.ser.is_open:
                 self.ser.close()
             self.log.emit(f"Disconnected.")
+            self._emit_flow_status(force=True)
             self.disconnected.emit()
         except Exception as exc:
             self.error.emit(f"Disconnect error: {exc}")
 
     def _ensure_connected(self) -> bool:
         if not self.ser or not self.ser.is_open:
+            self._emit_flow_status(force=True)
             self.error.emit("Serial port is not connected.")
             return False
         return True
@@ -187,11 +197,13 @@ class SerialWorker(QObject):
 
     def _read_lines_until(self, deadline: float) -> bool:
         if not self.ser or not self.ser.is_open:
+            self._emit_flow_status(force=True)
             return False
 
         acknowledged = False
 
         while time.time() < deadline:
+            self._emit_flow_status()
             waiting = self.ser.in_waiting
             if not waiting:
                 time.sleep(0.01)
@@ -221,6 +233,7 @@ class SerialWorker(QObject):
     def _read_available(self):
         try:
             self._read_lines_until(time.time() + 0.25)
+            self._emit_flow_status()
         except Exception as exc:
             self.error.emit(f"Read error: {exc}")
 
@@ -256,7 +269,75 @@ class SerialWorker(QObject):
             command += ";"
         return command
 
-    def _write_command(self, command: str) -> str:
+    def _is_connected(self) -> bool:
+        return bool(self.ser and self.ser.is_open)
+
+    def _read_cts(self) -> bool:
+        if not self._is_connected():
+            return False
+        try:
+            return bool(self.ser.cts)
+        except Exception:
+            return False
+
+    def _read_rts(self) -> bool:
+        if not self._is_connected():
+            return False
+        try:
+            return bool(self.ser.rts)
+        except Exception:
+            return False
+
+    def _read_out_waiting(self) -> int:
+        if not self._is_connected():
+            return 0
+        try:
+            return int(self.ser.out_waiting)
+        except Exception:
+            return 0
+
+    def _send_allowed_now(self) -> bool:
+        return self._is_connected() and self._read_cts() and self._read_out_waiting() == 0
+
+    def _emit_flow_status(self, force: bool = False) -> None:
+        status = (self._read_cts(), self._read_rts(), self._send_allowed_now())
+        if force or status != self._last_flow_status:
+            self._last_flow_status = status
+            self.flow_status_changed.emit(*status)
+
+    def _wait_for_send_allowed(self, timeout_s: float, command: str) -> None:
+        deadline = time.time() + timeout_s
+        blocked_logged = False
+        while time.time() < deadline:
+            if self._streaming and self._stop_streaming:
+                raise RuntimeError("Streaming interrupted by user.")
+            self._emit_flow_status()
+            if self._send_allowed_now():
+                return
+            if not blocked_logged:
+                self.log.emit(
+                    f"Waiting for CTS before sending {command}; no bytes will be written while blocked."
+                )
+                blocked_logged = True
+            self._read_lines_until(min(time.time() + 0.05, deadline))
+
+        self._emit_flow_status(force=True)
+        raise TimeoutError(f"CTS/output drain timeout before sending {command}")
+
+    def _wait_for_output_drain(self, timeout_s: float, command: str) -> None:
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if self._streaming and self._stop_streaming:
+                raise RuntimeError("Streaming interrupted by user.")
+            self._emit_flow_status()
+            if self._read_out_waiting() == 0:
+                return
+            self._read_lines_until(min(time.time() + 0.05, deadline))
+
+        self._emit_flow_status(force=True)
+        raise TimeoutError(f"Serial output did not drain after sending {command}")
+
+    def _write_command(self, command: str, cts_timeout_s: float = CTS_TIMEOUT_S) -> str:
         command = self._normalize_command(command)
         for part in re.split(r"[;:]", command):
             if part.strip().upper() in {"PA", "PR"}:
@@ -264,15 +345,22 @@ class SerialWorker(QObject):
                     f"{part.strip().upper()} requires at least one X,Y coordinate pair; "
                     "use PAx,y for an absolute move or PRdx,dy for a relative move."
                 )
-        self.ser.write(command.encode("ascii", errors="ignore"))
-        self.ser.flush()
+        self._wait_for_send_allowed(cts_timeout_s, command)
+        payload = command.encode("ascii", errors="ignore")
+        written = self.ser.write(payload)
+        if written != len(payload):
+            raise serial.SerialTimeoutException(
+                f"Serial write incomplete for {command}: {written}/{len(payload)} bytes"
+            )
+        self._wait_for_output_drain(cts_timeout_s, command)
         self.log.emit(f">> {command}")
+        self._emit_flow_status()
         return command
 
     def _wait_for_ack(self, command: str, timeout_s: float) -> None:
         deadline = time.time() + timeout_s
         while time.time() < deadline:
-            if self._stop_streaming:
+            if self._streaming and self._stop_streaming:
                 raise RuntimeError("Streaming interrupted by user.")
             acknowledged = self._read_lines_until(min(time.time() + 0.1, deadline))
             if self._last_machine_error is not None:
@@ -284,19 +372,22 @@ class SerialWorker(QObject):
 
         raise TimeoutError(f"No C acknowledgement received for {command}")
 
-    def _send_and_wait_ack(self, command: str, timeout_s: float) -> str:
+    def _send_and_wait_ack(
+        self,
+        command: str,
+        ack_timeout_s: float = ACK_TIMEOUT_S,
+        cts_timeout_s: float = CTS_TIMEOUT_S,
+    ) -> str:
         self._last_machine_error = None
-        sent = self._write_command(command)
-        self._wait_for_ack(sent, timeout_s)
+        sent = self._write_command(command, cts_timeout_s)
+        self._wait_for_ack(sent, ack_timeout_s)
         return sent
 
-    @Slot(list, float, bool, float, str)
+    @Slot(list, bool, str)
     def stream_commands(
         self,
         commands: list[str],
-        delay_s: float = 0.02,
-        wait_for_ack: bool = True,
-        ack_timeout_s: float = 30.0,
+        use_echo_ack: bool = True,
         iw_command: str = "",
     ):
         if not self._ensure_connected():
@@ -311,67 +402,79 @@ class SerialWorker(QObject):
         iw_command = self._normalize_command(iw_command)
 
         echo_enabled = False
+        completed = False
+        stopped_by_user = False
 
         try:
+            if any(self._normalize_command(command).upper() == "IN;" for command in commands):
+                if not iw_command:
+                    raise RuntimeError(
+                        "IN resets the input window, but no IW command "
+                        "was supplied for restoration."
+                    )
+
             for index, command in enumerate(commands, start=1):
                 if self._stop_streaming:
                     self.log.emit("Streaming interrupted by user.")
+                    stopped_by_user = True
                     break
 
                 command = self._normalize_command(command)
                 if not command:
                     continue
                 is_initialize = command.upper() == "IN;"
-                if is_initialize and not iw_command:
-                    raise RuntimeError(
-                        "IN resets the input window, but no IW command "
-                        "was supplied for restoration."
-                    )
 
-                if wait_for_ack:
-                    if is_initialize:
-                        # IN restores defaults, including non-echo mode. Do
-                        # not wait for a C that the reset will never produce.
-                        self._write_command(command)
-                        self._read_available()
-                        echo_enabled = False
+                if is_initialize:
+                    # IN restores defaults, including non-echo mode. Do not
+                    # wait for a C that the reset will never produce.
+                    self._write_command(command)
+                    self._read_available()
+                    echo_enabled = False
 
+                if use_echo_ack:
                     if not echo_enabled:
-                        self.log.emit(
-                            "Enabling echo acknowledgement mode with !CT1;"
-                        )
-                        self._send_and_wait_ack("!CT1;", ack_timeout_s)
+                        self.log.emit("Enabling echo acknowledgement mode with !CT1;")
+                        self._send_and_wait_ack("!CT1;")
                         echo_enabled = True
 
                     if not is_initialize:
-                        self._send_and_wait_ack(command, ack_timeout_s)
+                        self._send_and_wait_ack(command)
                     elif iw_command:
                         self.log.emit(f"Restoring input window with {iw_command}")
-                        self._send_and_wait_ack(iw_command, ack_timeout_s)
+                        self._send_and_wait_ack(iw_command)
                 else:
-                    self._write_command(command)
-                    self._read_available()
-                    if is_initialize:
+                    if not is_initialize:
+                        self._write_command(command)
+                        self._read_available()
+                    elif iw_command:
                         self.log.emit(f"Restoring input window with {iw_command}")
                         self._write_command(iw_command)
                         self._read_available()
-                    time.sleep(delay_s)
 
                 self.streaming_progress.emit(index, total)
 
-            self.streaming_finished.emit()
+            if stopped_by_user:
+                self.streaming_stopped.emit()
+            else:
+                completed = True
+                self.streaming_finished.emit()
         except Exception as exc:
             self.error.emit(f"Streaming error: {exc}")
         finally:
-            if echo_enabled and self.ser and self.ser.is_open:
+            if use_echo_ack and echo_enabled and completed and self.ser and self.ser.is_open:
                 try:
                     self.log.emit("Disabling echo acknowledgement mode with !CT0;")
                     self._write_command("!CT0;")
                     self._read_lines_until(time.time() + 0.5)
                 except Exception as exc:
                     self.error.emit(f"Could not disable echo mode: {exc}")
+            elif use_echo_ack and echo_enabled:
+                self.log.emit(
+                    "Echo acknowledgement mode may still be enabled; recover manually before streaming again."
+                )
             self._streaming = False
             self._stop_streaming = False
+            self._emit_flow_status(force=True)
 
     @Slot()
     def request_stop_streaming(self):
@@ -405,7 +508,7 @@ class MainWindow(QMainWindow):
     disconnect_requested = Signal()
     send_requested = Signal(str)
     read_requested = Signal()
-    stream_requested = Signal(list, float, bool, float, str)
+    stream_requested = Signal(list, bool, str)
     stop_stream_requested = Signal()
 
     def __init__(self):
@@ -437,6 +540,8 @@ class MainWindow(QMainWindow):
         self.worker.status_received.connect(self.update_machine_status)
         self.worker.streaming_progress.connect(self.update_progress)
         self.worker.streaming_finished.connect(self.on_stream_finished)
+        self.worker.streaming_stopped.connect(self.on_stream_stopped)
+        self.worker.flow_status_changed.connect(self.update_flow_status)
 
         self.hpgl_commands: list[str] = []
         self.lpkf_ini = LPKFIni(Path(__file__).resolve().with_name("lpkf.ini"))
@@ -675,21 +780,6 @@ class MainWindow(QMainWindow):
         load_gcode_btn.clicked.connect(self.load_gcode_file)
         load_btn = QPushButton("Load HP-GL")
         load_btn.clicked.connect(self.load_hpgl_file)
-        self.stream_delay = QDoubleSpinBox()
-        self.stream_delay.setRange(0.0, 2.0)
-        self.stream_delay.setDecimals(3)
-        self.stream_delay.setValue(0.02)
-        self.stream_delay.setSuffix(" s delay")
-        self.stream_delay.setToolTip("Used only when echo acknowledgement streaming is disabled.")
-        self.ack_streaming = QCheckBox("Wait for C echo (!CT1)")
-        self.ack_streaming.setChecked(True)
-        self.ack_streaming.setToolTip("Safer streaming: enable !CT1 and wait for C before sending the next command.")
-        self.ack_timeout = QDoubleSpinBox()
-        self.ack_timeout.setRange(1.0, 120.0)
-        self.ack_timeout.setDecimals(1)
-        self.ack_timeout.setValue(30.0)
-        self.ack_timeout.setSuffix(" s ack")
-        self.ack_timeout.setToolTip("Maximum time to wait for one machine acknowledgement.")
         stream_btn = QPushButton("Stream file")
         stream_btn.clicked.connect(self.stream_file)
         stop_stream_btn = QPushButton("Stop streaming")
@@ -701,19 +791,47 @@ class MainWindow(QMainWindow):
             "When disabled, G-code coordinates are relative to machine ZERO. "
             "This setting is applied when a G-code file is loaded."
         )
+        self.echo_ack_streaming = QCheckBox("Use C echo (!CT1)")
+        self.echo_ack_streaming.setChecked(True)
+        self.echo_ack_streaming.setToolTip(
+            "Optional protocol acknowledgement layer. When enabled, streaming waits for C after each command. "
+            "When disabled, streaming still waits for CTS before every write and does not use fixed delays."
+        )
         file_buttons.addWidget(load_gcode_btn)
         file_buttons.addWidget(load_btn)
         file_buttons.addWidget(self.apply_home_offset)
-        file_buttons.addWidget(self.ack_streaming)
-        file_buttons.addWidget(self.ack_timeout)
-        file_buttons.addWidget(self.stream_delay)
+        file_buttons.addWidget(self.echo_ack_streaming)
         file_buttons.addWidget(stream_btn)
         file_buttons.addWidget(stop_stream_btn)
+
+        flow_status = QHBoxLayout()
+        self.cts_indicator = QLabel("CTS: —")
+        self.rts_indicator = QLabel("RTS: —")
+        self.send_allowed_indicator = QLabel("Send: —")
+        for indicator in (
+            self.cts_indicator,
+            self.rts_indicator,
+            self.send_allowed_indicator,
+        ):
+            indicator.setMinimumWidth(95)
+            indicator.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.cts_indicator.setToolTip("Actual Clear To Send state read from pySerial.")
+        self.rts_indicator.setToolTip("RTS state reported by pySerial.")
+        self.send_allowed_indicator.setToolTip(
+            "Streaming may write only when the port is open, CTS is active, and no previous bytes remain queued."
+        )
+        flow_status.addWidget(QLabel("Serial flow"))
+        flow_status.addWidget(self.cts_indicator)
+        flow_status.addWidget(self.rts_indicator)
+        flow_status.addWidget(self.send_allowed_indicator)
+        flow_status.addStretch(1)
+        self.update_flow_status(False, False, False)
 
         self.preview = QPlainTextEdit()
         self.preview.setPlaceholderText("Loaded or translated HP-GL commands will appear here.")
         self.preview.setFont(QFont("Courier New", 10))
         file_layout.addLayout(file_buttons)
+        file_layout.addLayout(flow_status)
         file_layout.addWidget(self.preview, 2)
         right.addWidget(file_group, 2)
 
@@ -915,6 +1033,24 @@ class MainWindow(QMainWindow):
             self.refresh_top_actions()
         self.show_error(text)
 
+    def set_indicator(self, label: QLabel, name: str, active: bool) -> None:
+        if active:
+            label.setText(f"{name}: ON")
+            label.setStyleSheet(
+                "QLabel { background: #1f8f45; color: white; border: 1px solid #145c2d; padding: 2px; }"
+            )
+        else:
+            label.setText(f"{name}: OFF")
+            label.setStyleSheet(
+                "QLabel { background: #5f6368; color: white; border: 1px solid #3c4043; padding: 2px; }"
+            )
+
+    @Slot(bool, bool, bool)
+    def update_flow_status(self, cts: bool, rts: bool, send_allowed: bool) -> None:
+        self.set_indicator(self.cts_indicator, "CTS", cts)
+        self.set_indicator(self.rts_indicator, "RTS", rts)
+        self.set_indicator(self.send_allowed_indicator, "Send", send_allowed)
+
     def update_position(self, x: float, y: float, z: float):
         self.x_label.setText(f"X: {x:g}")
         self.y_label.setText(f"Y: {y:g}")
@@ -955,6 +1091,12 @@ class MainWindow(QMainWindow):
         self.refresh_top_actions()
         self.append_log("Streaming finished.")
         self.statusBar().showMessage("Streaming finished", 5000)
+
+    def on_stream_stopped(self) -> None:
+        self.streaming_active = False
+        self.refresh_top_actions()
+        self.append_log("Streaming stopped by user. Confirm machine state before recovery.")
+        self.statusBar().showMessage("Streaming stopped", 5000)
 
     def send_raw(self):
         text = self.raw_input.text().strip()
@@ -1097,9 +1239,7 @@ class MainWindow(QMainWindow):
         self.refresh_top_actions()
         self.stream_requested.emit(
             self.hpgl_commands,
-            float(self.stream_delay.value()),
-            self.ack_streaming.isChecked(),
-            float(self.ack_timeout.value()),
+            self.echo_ack_streaming.isChecked(),
             iw_command,
         )
 

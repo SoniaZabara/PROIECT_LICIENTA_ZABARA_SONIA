@@ -5,6 +5,24 @@ from lpkf_controller import SerialWorker
 
 class FakeSerial:
     is_open = True
+    cts = True
+    rts = True
+    out_waiting = 0
+    in_waiting = 0
+
+    def __init__(self):
+        self.writes: list[str] = []
+
+    def write(self, data: bytes) -> int:
+        self.writes.append(data.decode("ascii"))
+        return len(data)
+
+    def read(self, count: int) -> bytes:
+        return b""
+
+
+class BlockedCtsSerial(FakeSerial):
+    cts = False
 
 
 class RecordingSerialWorker(SerialWorker):
@@ -18,7 +36,12 @@ class RecordingSerialWorker(SerialWorker):
         self.events.append(("write", command))
         return command
 
-    def _send_and_wait_ack(self, command: str, timeout_s: float) -> str:
+    def _send_and_wait_ack(
+        self,
+        command: str,
+        ack_timeout_s: float = SerialWorker.ACK_TIMEOUT_S,
+        cts_timeout_s: float = SerialWorker.CTS_TIMEOUT_S,
+    ) -> str:
         command = self._normalize_command(command)
         self.events.append(("ack", command))
         return command
@@ -46,7 +69,6 @@ class SerialWorkerTests(unittest.TestCase):
 
         worker.stream_commands(
             ["IN", "!CM1", "PU"],
-            wait_for_ack=True,
             iw_command="IW0,0,68216,48533",
         )
 
@@ -62,13 +84,32 @@ class SerialWorkerTests(unittest.TestCase):
             ],
         )
 
-    def test_delay_streaming_also_restores_iw_after_initialization(self):
+    def test_streaming_can_use_echo_acknowledgement(self):
         worker = RecordingSerialWorker()
 
         worker.stream_commands(
             ["IN", "PU"],
-            delay_s=0,
-            wait_for_ack=False,
+            use_echo_ack=True,
+            iw_command="IW0,0,68216,48533",
+        )
+
+        self.assertEqual(
+            worker.events,
+            [
+                ("write", "IN;"),
+                ("ack", "!CT1;"),
+                ("ack", "IW0,0,68216,48533;"),
+                ("ack", "PU;"),
+                ("write", "!CT0;"),
+            ],
+        )
+
+    def test_streaming_can_disable_echo_without_using_delay_pacing(self):
+        worker = RecordingSerialWorker()
+
+        worker.stream_commands(
+            ["IN", "PU"],
+            use_echo_ack=False,
             iw_command="IW0,0,68216,48533",
         )
 
@@ -86,7 +127,7 @@ class SerialWorkerTests(unittest.TestCase):
         errors: list[str] = []
         worker.error.connect(errors.append)
 
-        worker.stream_commands(["IN"], wait_for_ack=True)
+        worker.stream_commands(["IN"])
 
         self.assertEqual(worker.events, [])
         self.assertEqual(len(errors), 1)
@@ -97,7 +138,6 @@ class SerialWorkerTests(unittest.TestCase):
 
         worker.stream_commands(
             ["PU", "IN", "PD"],
-            wait_for_ack=True,
             iw_command="IW0,0,68216,48533",
         )
 
@@ -120,6 +160,39 @@ class SerialWorkerTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "PA requires"):
             worker._write_command("PA;PR1000,0;")
+
+    def test_write_waits_for_cts_and_fails_without_transmitting_when_blocked(self):
+        worker = SerialWorker()
+        serial_port = BlockedCtsSerial()
+        worker.ser = serial_port
+
+        with self.assertRaisesRegex(TimeoutError, "CTS"):
+            worker._write_command("PU;", cts_timeout_s=0.02)
+
+        self.assertEqual(serial_port.writes, [])
+
+    def test_stale_stop_flag_does_not_block_manual_writes_after_streaming(self):
+        worker = SerialWorker()
+        serial_port = FakeSerial()
+        worker.ser = serial_port
+        worker._streaming = False
+        worker._stop_streaming = True
+
+        worker._write_command("IN;", cts_timeout_s=0.02)
+
+        self.assertEqual(serial_port.writes, ["IN;"])
+
+    def test_stop_flag_still_interrupts_active_stream_writes(self):
+        worker = SerialWorker()
+        serial_port = FakeSerial()
+        worker.ser = serial_port
+        worker._streaming = True
+        worker._stop_streaming = True
+
+        with self.assertRaisesRegex(RuntimeError, "Streaming interrupted"):
+            worker._write_command("PU;", cts_timeout_s=0.02)
+
+        self.assertEqual(serial_port.writes, [])
 
 
 if __name__ == "__main__":
