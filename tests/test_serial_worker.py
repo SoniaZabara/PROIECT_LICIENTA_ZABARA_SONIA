@@ -171,6 +171,26 @@ class SerialWorkerTests(unittest.TestCase):
 
         self.assertEqual(serial_port.writes, [])
 
+    def test_wait_command_extends_next_cts_timeout(self):
+        worker = SerialWorker()
+        serial_port = FakeSerial()
+        worker.ser = serial_port
+
+        worker._write_command("!TW180000;", cts_timeout_s=0.02)
+
+        self.assertEqual(serial_port.writes, ["!TW180000;"])
+        self.assertEqual(worker._next_timeout_for_command(30.0), 210.0)
+
+    def test_cts_timeout_error_reports_flow_state(self):
+        worker = SerialWorker()
+        serial_port = BlockedCtsSerial()
+        worker.ser = serial_port
+
+        with self.assertRaisesRegex(TimeoutError, "CTS=OFF, RTS=ON, out_waiting=0"):
+            worker._write_command("PU;", cts_timeout_s=0.02)
+
+        self.assertEqual(serial_port.writes, [])
+
     def test_stale_stop_flag_does_not_block_manual_writes_after_streaming(self):
         worker = SerialWorker()
         serial_port = FakeSerial()

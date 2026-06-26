@@ -96,6 +96,7 @@ class SerialWorker(QObject):
 
     ACK_TIMEOUT_S = 30.0
     CTS_TIMEOUT_S = 30.0
+    WAIT_COMMAND_MARGIN_S = 30.0
 
     def __init__(self):
         super().__init__()
@@ -105,6 +106,7 @@ class SerialWorker(QObject):
         self._rx_buffer = ""
         self._last_machine_error: str | None = None
         self._last_flow_status: tuple[bool, bool, bool] | None = None
+        self._next_send_timeout_s: float | None = None
 
     @Slot(object)
     def connect_port(self, cfg: SerialConfig):
@@ -305,6 +307,31 @@ class SerialWorker(QObject):
             self._last_flow_status = status
             self.flow_status_changed.emit(*status)
 
+    def _flow_state_text(self) -> str:
+        return (
+            f"CTS={'ON' if self._read_cts() else 'OFF'}, "
+            f"RTS={'ON' if self._read_rts() else 'OFF'}, "
+            f"out_waiting={self._read_out_waiting()}"
+        )
+
+    def _next_timeout_for_command(self, default_timeout_s: float) -> float:
+        timeout_s = default_timeout_s
+        if self._next_send_timeout_s is not None:
+            timeout_s = max(timeout_s, self._next_send_timeout_s)
+            self._next_send_timeout_s = None
+        return timeout_s
+
+    def _remember_post_command_wait(self, command: str) -> None:
+        match = re.fullmatch(r"!TW\s*([0-9]+(?:\.[0-9]+)?)\s*;", command, re.IGNORECASE)
+        if not match:
+            return
+
+        wait_s = float(match.group(1)) / 1000.0
+        self._next_send_timeout_s = wait_s + self.WAIT_COMMAND_MARGIN_S
+        self.log.emit(
+            f"Next CTS wait allows {self._next_send_timeout_s:g}s after {command}."
+        )
+
     def _wait_for_send_allowed(self, timeout_s: float, command: str) -> None:
         deadline = time.time() + timeout_s
         blocked_logged = False
@@ -322,7 +349,10 @@ class SerialWorker(QObject):
             self._read_lines_until(min(time.time() + 0.05, deadline))
 
         self._emit_flow_status(force=True)
-        raise TimeoutError(f"CTS/output drain timeout before sending {command}")
+        raise TimeoutError(
+            f"CTS/output drain timeout after {timeout_s:g}s before sending "
+            f"{command}; {self._flow_state_text()}"
+        )
 
     def _wait_for_output_drain(self, timeout_s: float, command: str) -> None:
         deadline = time.time() + timeout_s
@@ -335,7 +365,10 @@ class SerialWorker(QObject):
             self._read_lines_until(min(time.time() + 0.05, deadline))
 
         self._emit_flow_status(force=True)
-        raise TimeoutError(f"Serial output did not drain after sending {command}")
+        raise TimeoutError(
+            f"Serial output did not drain after {timeout_s:g}s for "
+            f"{command}; {self._flow_state_text()}"
+        )
 
     def _write_command(self, command: str, cts_timeout_s: float = CTS_TIMEOUT_S) -> str:
         command = self._normalize_command(command)
@@ -345,15 +378,17 @@ class SerialWorker(QObject):
                     f"{part.strip().upper()} requires at least one X,Y coordinate pair; "
                     "use PAx,y for an absolute move or PRdx,dy for a relative move."
                 )
-        self._wait_for_send_allowed(cts_timeout_s, command)
+        effective_timeout_s = self._next_timeout_for_command(cts_timeout_s)
+        self._wait_for_send_allowed(effective_timeout_s, command)
         payload = command.encode("ascii", errors="ignore")
         written = self.ser.write(payload)
         if written != len(payload):
             raise serial.SerialTimeoutException(
                 f"Serial write incomplete for {command}: {written}/{len(payload)} bytes"
             )
-        self._wait_for_output_drain(cts_timeout_s, command)
+        self._wait_for_output_drain(effective_timeout_s, command)
         self.log.emit(f">> {command}")
+        self._remember_post_command_wait(command)
         self._emit_flow_status()
         return command
 
@@ -792,7 +827,7 @@ class MainWindow(QMainWindow):
             "This setting is applied when a G-code file is loaded."
         )
         self.echo_ack_streaming = QCheckBox("Use C echo (!CT1)")
-        self.echo_ack_streaming.setChecked(True)
+        self.echo_ack_streaming.setChecked(False)
         self.echo_ack_streaming.setToolTip(
             "Optional protocol acknowledgement layer. When enabled, streaming waits for C after each command. "
             "When disabled, streaming still waits for CTS before every write and does not use fixed delays."
