@@ -113,6 +113,7 @@ class SerialWorker(QObject):
         self._last_flow_status: tuple[bool, bool, bool] | None = None
         self._next_send_timeout_s: float | None = None
         self._rm_status_codes: list[int] | None = None
+        self._cts_timeout_s = self.CTS_TIMEOUT_S
 
     @Slot(object)
     def connect_port(self, cfg: SerialConfig):
@@ -178,6 +179,10 @@ class SerialWorker(QObject):
     @Slot()
     def read_available(self):
         self._read_available()
+
+    @Slot(float)
+    def set_cts_timeout(self, seconds: float):
+        self._cts_timeout_s = max(0.1, float(seconds))
 
     def _handle_received_line(self, line: str) -> bool:
         line = line.strip()
@@ -400,7 +405,7 @@ class SerialWorker(QObject):
             f"{command}; {self._flow_state_text()}"
         )
 
-    def _write_command(self, command: str, cts_timeout_s: float = CTS_TIMEOUT_S) -> str:
+    def _write_command(self, command: str, cts_timeout_s: float | None = None) -> str:
         command = self._normalize_command(command)
         for part in re.split(r"[;:]", command):
             if part.strip().upper() in {"PA", "PR"}:
@@ -408,7 +413,8 @@ class SerialWorker(QObject):
                     f"{part.strip().upper()} requires at least one X,Y coordinate pair; "
                     "use PAx,y for an absolute move or PRdx,dy for a relative move."
                 )
-        effective_timeout_s = self._next_timeout_for_command(cts_timeout_s)
+        base_timeout_s = self._cts_timeout_s if cts_timeout_s is None else cts_timeout_s
+        effective_timeout_s = self._next_timeout_for_command(base_timeout_s)
         self._wait_for_send_allowed(effective_timeout_s, command)
         payload = command.encode("ascii", errors="ignore")
         written = self.ser.write(payload)
@@ -441,7 +447,7 @@ class SerialWorker(QObject):
         self,
         command: str,
         ack_timeout_s: float = ACK_TIMEOUT_S,
-        cts_timeout_s: float = CTS_TIMEOUT_S,
+        cts_timeout_s: float | None = None,
     ) -> str:
         self._last_machine_error = None
         sent = self._write_command(command, cts_timeout_s)
@@ -756,6 +762,7 @@ class MainWindow(QMainWindow):
     read_requested = Signal()
     stream_requested = Signal(list, bool, str)
     stop_stream_requested = Signal()
+    cts_timeout_changed = Signal(float)
     POLL_INTERVAL_MS = 1000
 
     def __init__(self):
@@ -773,6 +780,7 @@ class MainWindow(QMainWindow):
         self.send_requested.connect(self.worker.send_command)
         self.read_requested.connect(self.worker.read_available)
         self.stream_requested.connect(self.worker.stream_commands)
+        self.cts_timeout_changed.connect(self.worker.set_cts_timeout)
         self.stop_stream_requested.connect(
             self.worker.request_stop_streaming,
             Qt.ConnectionType.DirectConnection,
@@ -1076,9 +1084,23 @@ class MainWindow(QMainWindow):
             indicator.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.cts_indicator.setToolTip("Actual Clear To Send state read from pySerial.")
         self.rts_indicator.setToolTip("RTS state reported by pySerial.")
+        self.cts_timeout_spin = QDoubleSpinBox()
+        self.cts_timeout_spin.setRange(0.5, 300.0)
+        self.cts_timeout_spin.setDecimals(1)
+        self.cts_timeout_spin.setSingleStep(5.0)
+        self.cts_timeout_spin.setSuffix(" s")
+        self.cts_timeout_spin.setValue(SerialWorker.CTS_TIMEOUT_S)
+        self.cts_timeout_spin.setToolTip(
+            "How long the worker waits for CTS/output drain before reporting a serial stall."
+        )
+        self.cts_timeout_spin.valueChanged.connect(
+            lambda value: self.cts_timeout_changed.emit(float(value))
+        )
         flow_status.addWidget(QLabel("Serial flow"))
         flow_status.addWidget(self.cts_indicator)
         flow_status.addWidget(self.rts_indicator)
+        flow_status.addWidget(QLabel("CTS timeout"))
+        flow_status.addWidget(self.cts_timeout_spin)
         flow_status.addStretch(1)
         self.update_flow_status(False, False, False)
 
