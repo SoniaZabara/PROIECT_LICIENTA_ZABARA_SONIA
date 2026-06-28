@@ -324,6 +324,18 @@ class SerialWorkerTests(unittest.TestCase):
         self.assertEqual(serial_port.writes, ["!TW180000;"])
         self.assertEqual(worker._next_timeout_for_command(30.0), 210.0)
 
+    def test_wait_command_uses_configured_cts_timeout_as_margin(self):
+        worker = SerialWorker()
+        serial_port = FakeSerial()
+        worker.ser = serial_port
+        worker.set_cts_timeout(35.0)
+
+        worker._write_command("!TW10000;")
+
+        self.assertEqual(serial_port.writes, ["!TW10000;"])
+        self.assertEqual(worker._next_timeout_for_command(30.0), 45.0)
+        self.assertEqual(worker._ack_timeout_for_command("!TW10000;"), 45.0)
+
     def test_rm_status_accepts_reached_speed_after_zero(self):
         worker = SerialWorker()
         serial_port = BufferedSerial(b"0\r8\r")

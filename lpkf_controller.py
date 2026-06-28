@@ -101,7 +101,6 @@ class SerialWorker(QObject):
 
     ACK_TIMEOUT_S = 30.0
     CTS_TIMEOUT_S = 30.0
-    WAIT_COMMAND_MARGIN_S = 30.0
 
     def __init__(self):
         super().__init__()
@@ -362,9 +361,10 @@ class SerialWorker(QObject):
             return
 
         wait_s = float(match.group(1)) / 1000.0
-        self._next_send_timeout_s = wait_s + self.WAIT_COMMAND_MARGIN_S
+        self._next_send_timeout_s = wait_s + self._cts_timeout_s
         self.log.emit(
-            f"Next CTS wait allows {self._next_send_timeout_s:g}s after {command}."
+            f"Next CTS wait allows {self._next_send_timeout_s:g}s after {command} "
+            f"({wait_s:g}s wait + {self._cts_timeout_s:g}s CTS timeout)."
         )
 
     def _wait_for_send_allowed(self, timeout_s: float, command: str) -> None:
@@ -460,7 +460,7 @@ class SerialWorker(QObject):
         if match:
             timeout_s = max(
                 timeout_s,
-                float(match.group(1)) / 1000.0 + self.WAIT_COMMAND_MARGIN_S,
+                float(match.group(1)) / 1000.0 + self._cts_timeout_s,
             )
         return timeout_s
 
