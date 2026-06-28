@@ -75,6 +75,7 @@ class HPGLPostProcessor:
         self.tool_down = False
 
         self.emit("IN;")
+        #self.emit("!TS250;") 
         self.emit("!CM1;")  # milling mode
         self.emit("PU;")
         if self.work_origin_steps is not None:
@@ -189,7 +190,9 @@ class HPGLPostProcessor:
         if tool_down == self.tool_down:
             return
 
+        self.emit("!TW500;")  # dwell to allow tool to settle before changing state
         self.emit("PD;" if tool_down else "PU;")
+        self.emit("!TW500;")  # dwell to allow tool to settle after changing state
         self.tool_down = tool_down
 
     def emit_xy_if_changed(self, x: float, y: float):

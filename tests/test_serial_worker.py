@@ -1,7 +1,7 @@
-import time
 import unittest
+import time
 
-from lpkf_controller import SerialWorker
+from lpkf_controller import SerialWorker, SpindleStatusError
 
 
 class FakeSerial:
@@ -62,6 +62,16 @@ class RecordingSerialWorker(SerialWorker):
         self.events.append(("ack", command))
         return command
 
+    def _send_rm_status_command(
+        self,
+        command: str,
+        requested_thousands: int,
+        timeout_s: float = SerialWorker.ACK_TIMEOUT_S,
+    ) -> str:
+        command = self._normalize_command(command)
+        self.events.append(("rm", command))
+        return command
+
     def _read_lines_until(self, deadline: float) -> bool:
         return False
 
@@ -69,6 +79,23 @@ class RecordingSerialWorker(SerialWorker):
 class InterruptedSerialWorker(RecordingSerialWorker):
     def _write_command(self, command: str) -> str:
         raise RuntimeError("Streaming interrupted by user.")
+
+
+class FailingSpindleWorker(RecordingSerialWorker):
+    def _send_rm_status_command(
+        self,
+        command: str,
+        requested_thousands: int,
+        timeout_s: float = SerialWorker.ACK_TIMEOUT_S,
+    ) -> str:
+        command = self._normalize_command(command)
+        self.events.append(("rm", command))
+        if requested_thousands != 0:
+            raise SpindleStatusError(
+                f"Spindle did not reach requested speed for {command}; "
+                "machine returned status 2 after 0."
+            )
+        return command
 
 
 class SerialWorkerTests(unittest.TestCase):
@@ -163,6 +190,67 @@ class SerialWorkerTests(unittest.TestCase):
             ],
         )
 
+    def test_echo_policy_skips_c_ack_for_open_channel(self):
+        worker = RecordingSerialWorker()
+
+        worker.stream_commands(["!OC", "!CC"], use_echo_ack=True)
+
+        self.assertEqual(
+            worker.events,
+            [
+                ("ack", "!CT1;"),
+                ("write", "!OC;"),
+                ("ack", "!CC;"),
+                ("write", "!CT0;"),
+            ],
+        )
+
+    def test_echo_policy_waits_for_rm_status_instead_of_c_ack(self):
+        worker = RecordingSerialWorker()
+
+        worker.stream_commands(["!OC", "!RM30", "!CC"], use_echo_ack=True)
+
+        self.assertEqual(
+            worker.events,
+            [
+                ("ack", "!CT1;"),
+                ("write", "!OC;"),
+                ("rm", "!RM30;"),
+                ("ack", "!CC;"),
+                ("write", "!CT0;"),
+            ],
+        )
+
+    def test_spindle_status_failure_stops_stream_and_spindle(self):
+        worker = FailingSpindleWorker()
+        errors: list[str] = []
+        finished: list[bool] = []
+        worker.error.connect(errors.append)
+        worker.streaming_finished.connect(lambda: finished.append(True))
+
+        worker.stream_commands(
+            ["!OC", "!RM30", "!CC", "PA100,100"],
+            use_echo_ack=True,
+        )
+
+        self.assertEqual(
+            worker.events,
+            [
+                ("ack", "!CT1;"),
+                ("write", "!OC;"),
+                ("rm", "!RM30;"),
+                ("ack", "!CC;"),
+                ("write", "!OC;"),
+                ("rm", "!RM0;"),
+                ("ack", "!CC;"),
+            ],
+        )
+        self.assertEqual(len(errors), 1)
+        self.assertIn("Spindle did not reach requested speed", errors[0])
+        self.assertEqual(finished, [])
+        self.assertFalse(worker._streaming)
+        self.assertFalse(worker._stop_streaming)
+
     def test_stop_interrupt_during_stream_emits_stopped_not_error(self):
         worker = InterruptedSerialWorker()
         stopped: list[bool] = []
@@ -235,6 +323,34 @@ class SerialWorkerTests(unittest.TestCase):
 
         self.assertEqual(serial_port.writes, ["!TW180000;"])
         self.assertEqual(worker._next_timeout_for_command(30.0), 210.0)
+
+    def test_rm_status_accepts_reached_speed_after_zero(self):
+        worker = SerialWorker()
+        serial_port = BufferedSerial(b"0\r8\r")
+        worker.ser = serial_port
+
+        worker._send_rm_status_command("!RM30;", 30, timeout_s=0.1)
+
+        self.assertEqual(serial_port.writes, ["!RM30;"])
+
+    def test_rm_status_rejects_warmup_speed_after_zero(self):
+        worker = SerialWorker()
+        serial_port = BufferedSerial(b"0\r2\r")
+        worker.ser = serial_port
+
+        with self.assertRaisesRegex(SpindleStatusError, "did not reach"):
+            worker._send_rm_status_command("!RM30;", 30, timeout_s=0.1)
+
+        self.assertEqual(serial_port.writes, ["!RM30;"])
+
+    def test_rm_zero_accepts_stop_status_after_zero(self):
+        worker = SerialWorker()
+        serial_port = BufferedSerial(b"0\r9\r")
+        worker.ser = serial_port
+
+        worker._send_rm_status_command("!RM0;", 0, timeout_s=0.1)
+
+        self.assertEqual(serial_port.writes, ["!RM0;"])
 
     def test_cts_timeout_error_reports_flow_state(self):
         worker = SerialWorker()

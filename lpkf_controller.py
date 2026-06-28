@@ -80,6 +80,11 @@ class SerialConfig:
     timeout: float = 0.2
     write_timeout: float = 2.0
 
+
+class SpindleStatusError(RuntimeError):
+    pass
+
+
 class SerialWorker(QObject):
     connected = Signal(str)
     disconnected = Signal()
@@ -107,6 +112,7 @@ class SerialWorker(QObject):
         self._last_machine_error: str | None = None
         self._last_flow_status: tuple[bool, bool, bool] | None = None
         self._next_send_timeout_s: float | None = None
+        self._rm_status_codes: list[int] | None = None
 
     @Slot(object)
     def connect_port(self, cfg: SerialConfig):
@@ -189,6 +195,9 @@ class SerialWorker(QObject):
         if line == "C":
             return True
 
+        if self._rm_status_codes is not None and re.fullmatch(r"\d+", line):
+            self._rm_status_codes.extend(int(char) for char in line)
+
         if re.fullmatch(r"E\d+", line, flags=re.IGNORECASE):
             self._last_machine_error = line.upper()
 
@@ -226,6 +235,12 @@ class SerialWorker(QObject):
             acknowledged = self._handle_received_line(self._rx_buffer) or acknowledged
             self._rx_buffer = ""
         elif self._rx_buffer.strip() == "Z":
+            self._handle_received_line(self._rx_buffer)
+            self._rx_buffer = ""
+        elif (
+            self._rm_status_codes is not None
+            and re.fullmatch(r"\d+", self._rx_buffer.strip())
+        ):
             self._handle_received_line(self._rx_buffer)
             self._rx_buffer = ""
         return acknowledged
@@ -433,6 +448,156 @@ class SerialWorker(QObject):
         self._wait_for_ack(sent, ack_timeout_s)
         return sent
 
+    def _ack_timeout_for_command(self, command: str) -> float:
+        timeout_s = self.ACK_TIMEOUT_S
+        match = re.fullmatch(r"!TW\s*([0-9]+(?:\.[0-9]+)?)\s*;", command, re.IGNORECASE)
+        if match:
+            timeout_s = max(
+                timeout_s,
+                float(match.group(1)) / 1000.0 + self.WAIT_COMMAND_MARGIN_S,
+            )
+        return timeout_s
+
+    def _rm_speed_for_command(self, command: str) -> int | None:
+        match = re.fullmatch(r"!RM\s*([0-9]+)\s*;", command, re.IGNORECASE)
+        if not match:
+            return None
+        return int(match.group(1))
+
+    def _is_no_ack_echo_command(self, command: str) -> bool:
+        return bool(re.fullmatch(r"!OC\s*;", command, re.IGNORECASE))
+
+    def _send_with_echo_policy(self, command: str) -> str:
+        command = self._normalize_command(command)
+        rm_speed = self._rm_speed_for_command(command)
+
+        if self._is_no_ack_echo_command(command):
+            sent = self._write_command(command)
+            self._read_available()
+            return sent
+
+        if rm_speed is not None:
+            return self._send_rm_status_command(command, rm_speed)
+
+        return self._send_and_wait_ack(
+            command,
+            ack_timeout_s=self._ack_timeout_for_command(command),
+        )
+
+    def _send_rm_status_command(
+        self,
+        command: str,
+        requested_thousands: int,
+        timeout_s: float = ACK_TIMEOUT_S,
+    ) -> str:
+        self._last_machine_error = None
+        sent = self._write_command(command)
+        self._wait_for_rm_status(sent, requested_thousands, timeout_s)
+        return sent
+
+    def _wait_for_rm_status(
+        self,
+        command: str,
+        requested_thousands: int,
+        timeout_s: float,
+    ) -> None:
+        deadline = time.time() + timeout_s
+        saw_ready_marker = False
+        self._rm_status_codes = []
+
+        try:
+            while time.time() < deadline:
+                if self._streaming and self._stop_streaming:
+                    raise RuntimeError("Streaming interrupted by user.")
+
+                self._read_lines_until(min(time.time() + 0.1, deadline))
+                if self._last_machine_error is not None:
+                    raise SpindleStatusError(
+                        f"Machine returned {self._last_machine_error} for {command}"
+                    )
+
+                while self._rm_status_codes:
+                    code = self._rm_status_codes.pop(0)
+                    if not saw_ready_marker:
+                        if code != 0:
+                            raise SpindleStatusError(
+                                f"Unexpected first spindle response {code} for "
+                                f"{command}; expected 0."
+                            )
+                        saw_ready_marker = True
+                        continue
+
+                    self._validate_rm_final_status(
+                        command,
+                        requested_thousands,
+                        code,
+                    )
+                    return
+
+            if saw_ready_marker:
+                raise TimeoutError(
+                    f"No final spindle status received for {command} after 0."
+                )
+            raise TimeoutError(f"No spindle status received for {command}")
+        finally:
+            self._rm_status_codes = None
+
+    def _validate_rm_final_status(
+        self,
+        command: str,
+        requested_thousands: int,
+        status_code: int,
+    ) -> None:
+        if requested_thousands == 0:
+            if status_code == 9:
+                self.log.emit(f"Spindle stop confirmed by status 9 for {command}.")
+                return
+            raise SpindleStatusError(
+                f"Unexpected spindle stop status {status_code} for {command}; "
+                "expected 9."
+            )
+
+        if status_code == 8:
+            self.log.emit(f"Spindle speed confirmed by status 8 for {command}.")
+            return
+
+        if status_code in {1, 2}:
+            raise SpindleStatusError(
+                f"Spindle did not reach requested speed for {command}; "
+                f"machine returned status {status_code} after 0."
+            )
+
+        raise SpindleStatusError(
+            f"Unexpected spindle status {status_code} for {command}; expected 8."
+        )
+
+    def _stop_spindle_after_stream_error(self) -> str | None:
+        if not self.ser or not self.ser.is_open:
+            return "Could not stop spindle after streaming error: serial port is not connected."
+
+        close_error: str | None = None
+        try:
+            self.log.emit(
+                "Closing spindle channel after streaming error with !CC;."
+            )
+            self._send_and_wait_ack("!CC;")
+        except Exception as exc:
+            close_error = f"Could not close spindle channel after streaming error: {exc}"
+
+        try:
+            self.log.emit(
+                "Stopping spindle after streaming error with !OC; !RM0; !CC;."
+            )
+            self._write_command("!OC;")
+            self._read_available()
+            self._send_rm_status_command("!RM0;", 0)
+            self._send_and_wait_ack("!CC;")
+        except Exception as exc:
+            stop_error = f"Could not stop spindle after streaming error: {exc}"
+            return f"{close_error} {stop_error}" if close_error else stop_error
+
+        return close_error
+
     @Slot(list, bool, str)
     def stream_commands(
         self,
@@ -456,6 +621,7 @@ class SerialWorker(QObject):
         stopped_by_user = False
         stream_result: str | None = None
         stream_error: str | None = None
+        safety_stop_error: str | None = None
         cleanup_error: str | None = None
 
         try:
@@ -487,14 +653,14 @@ class SerialWorker(QObject):
                 if use_echo_ack:
                     if not echo_enabled:
                         self.log.emit("Enabling echo acknowledgement mode with !CT1;")
-                        self._send_and_wait_ack("!CT1;")
+                        self._send_with_echo_policy("!CT1;")
                         echo_enabled = True
 
                     if not is_initialize:
-                        self._send_and_wait_ack(command)
+                        self._send_with_echo_policy(command)
                     elif iw_command:
                         self.log.emit(f"Restoring input window with {iw_command}")
-                        self._send_and_wait_ack(iw_command)
+                        self._send_with_echo_policy(iw_command)
                 else:
                     if not is_initialize:
                         self._write_command(command)
@@ -516,6 +682,9 @@ class SerialWorker(QObject):
                 self.log.emit("Streaming interrupted by user.")
                 stopped_by_user = True
                 stream_result = "stopped"
+            elif isinstance(exc, SpindleStatusError):
+                stream_error = f"Streaming error: {exc}"
+                safety_stop_error = self._stop_spindle_after_stream_error()
             else:
                 stream_error = f"Streaming error: {exc}"
         finally:
@@ -534,11 +703,21 @@ class SerialWorker(QObject):
             self._stop_streaming = False
             self._emit_flow_status(force=True)
 
+        reported_error = False
         if stream_error is not None:
             self.error.emit(stream_error)
-        elif cleanup_error is not None:
+            reported_error = True
+        if safety_stop_error is not None:
+            self.error.emit(safety_stop_error)
+            reported_error = True
+        if cleanup_error is not None:
             self.error.emit(cleanup_error)
-        elif stream_result == "stopped":
+            reported_error = True
+
+        if reported_error:
+            return
+
+        if stream_result == "stopped":
             self.streaming_stopped.emit()
         elif stream_result == "finished":
             self.streaming_finished.emit()
@@ -818,14 +997,14 @@ class MainWindow(QMainWindow):
         machine_group = QGroupBox("Machine commands")
         machine_layout = QGridLayout(machine_group)
 
-        spindle_on = QPushButton("Spindle ON !EM1;")
-        spindle_off = QPushButton("Spindle OFF !EM0;")
+        spindle_on = QPushButton("Vacuum ON !EM1;")
+        spindle_off = QPushButton("Vacuum OFF !EM0;")
         stop_btn = QPushButton("Pause !ST;")
         go_btn = QPushButton("Resume !GO;")
         clear_btn = QPushButton("Clear buffer !CB;")
         init_btn = QPushButton("Initialize IN;")
 
-        spindle_on.clicked.connect(lambda: self.confirm_and_send("Turn spindle ON?", "!EM1;"))
+        spindle_on.clicked.connect(lambda: self.confirm_and_send("Turn vacuum ON?", "!EM1;"))
         spindle_off.clicked.connect(lambda: self.send_requested.emit("!EM0;"))
         stop_btn.clicked.connect(lambda: self.send_requested.emit("!ST;"))
         go_btn.clicked.connect(lambda: self.send_requested.emit("!GO;"))
@@ -1309,7 +1488,9 @@ class MainWindow(QMainWindow):
             self,
             "Start streaming?",
             "Start sending the loaded HP-GL file to the machine?\n\n"
-            "Make sure the tool is raised, the work area is clear, and the spindle state is correct.",
+            "Make sure the tool is raised, the work area is clear, and the spindle state is correct.\n"
+            "MAKE SURE THE SPINDLE IS WARMED UP AND READY TO CUT BEFORE STREAMING.\n"
+            "failure to do so may damage the machine, workpiece and especially the SPINDLE which will underperfom and not reach it's target speed!!!",
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
