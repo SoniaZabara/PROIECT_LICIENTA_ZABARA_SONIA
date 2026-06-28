@@ -1,3 +1,4 @@
+import time
 import unittest
 
 from lpkf_controller import SerialWorker
@@ -25,6 +26,21 @@ class BlockedCtsSerial(FakeSerial):
     cts = False
 
 
+class BufferedSerial(FakeSerial):
+    def __init__(self, data: bytes):
+        super().__init__()
+        self._buffer = bytearray(data)
+
+    @property
+    def in_waiting(self) -> int:
+        return len(self._buffer)
+
+    def read(self, count: int) -> bytes:
+        chunk = self._buffer[:count]
+        del self._buffer[:count]
+        return bytes(chunk)
+
+
 class RecordingSerialWorker(SerialWorker):
     def __init__(self):
         super().__init__()
@@ -50,6 +66,11 @@ class RecordingSerialWorker(SerialWorker):
         return False
 
 
+class InterruptedSerialWorker(RecordingSerialWorker):
+    def _write_command(self, command: str) -> str:
+        raise RuntimeError("Streaming interrupted by user.")
+
+
 class SerialWorkerTests(unittest.TestCase):
     def test_concatenated_reset_and_ack_responses_are_split(self):
         worker = SerialWorker()
@@ -63,6 +84,26 @@ class SerialWorkerTests(unittest.TestCase):
         self.assertTrue(acknowledged)
         self.assertEqual(received, ["Z"])
         self.assertEqual(logs, ["<< Z", "<< C"])
+
+    def test_read_available_does_not_wait_when_idle(self):
+        worker = SerialWorker()
+        worker.ser = FakeSerial()
+
+        start = time.perf_counter()
+        worker._read_available()
+        elapsed = time.perf_counter() - start
+
+        self.assertLess(elapsed, 0.1)
+
+    def test_read_available_drains_waiting_bytes_without_delay(self):
+        worker = SerialWorker()
+        worker.ser = BufferedSerial(b"P 1,2,3\r")
+        received: list[str] = []
+        worker.line_received.connect(received.append)
+
+        worker._read_available()
+
+        self.assertEqual(received, ["P 1,2,3"])
 
     def test_initialization_precedes_echo_enable(self):
         worker = RecordingSerialWorker()
@@ -121,6 +162,20 @@ class SerialWorkerTests(unittest.TestCase):
                 ("write", "PU;"),
             ],
         )
+
+    def test_stop_interrupt_during_stream_emits_stopped_not_error(self):
+        worker = InterruptedSerialWorker()
+        stopped: list[bool] = []
+        errors: list[str] = []
+        worker.streaming_stopped.connect(lambda: stopped.append(True))
+        worker.error.connect(errors.append)
+
+        worker.stream_commands(["PU"], use_echo_ack=False)
+
+        self.assertEqual(stopped, [True])
+        self.assertEqual(errors, [])
+        self.assertFalse(worker._streaming)
+        self.assertFalse(worker._stop_streaming)
 
     def test_initialization_without_iw_is_rejected_before_reset(self):
         worker = RecordingSerialWorker()

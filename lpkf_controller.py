@@ -165,8 +165,7 @@ class SerialWorker(QObject):
 
         try:
             self._write_command(command)
-            time.sleep(0.05)
-            self._read_available()
+            self._read_available(wait_s=0.25)
         except Exception as exc:
             self.error.emit(f"Send error: {exc}")
 
@@ -197,6 +196,40 @@ class SerialWorker(QObject):
         self._parse_machine_response(line)
         return False
 
+    def _read_waiting_input(self) -> bool:
+        if not self.ser or not self.ser.is_open:
+            self._emit_flow_status(force=True)
+            return False
+
+        acknowledged = False
+        waiting = self.ser.in_waiting
+        if not waiting:
+            return False
+
+        self._rx_buffer += self.ser.read(waiting).decode("ascii", errors="replace")
+        parts = re.split(r"[\r\n]+", self._rx_buffer)
+        if self._rx_buffer.endswith(("\r", "\n")):
+            complete_lines = parts
+            self._rx_buffer = ""
+        else:
+            complete_lines = parts[:-1]
+            self._rx_buffer = parts[-1]
+
+        for line in complete_lines:
+            acknowledged = self._handle_received_line(line) or acknowledged
+
+        return acknowledged
+
+    def _finish_short_response_fragment(self) -> bool:
+        acknowledged = False
+        if self._rx_buffer.strip() == "C":
+            acknowledged = self._handle_received_line(self._rx_buffer) or acknowledged
+            self._rx_buffer = ""
+        elif self._rx_buffer.strip() == "Z":
+            self._handle_received_line(self._rx_buffer)
+            self._rx_buffer = ""
+        return acknowledged
+
     def _read_lines_until(self, deadline: float) -> bool:
         if not self.ser or not self.ser.is_open:
             self._emit_flow_status(force=True)
@@ -204,37 +237,19 @@ class SerialWorker(QObject):
 
         acknowledged = False
 
-        while time.time() < deadline:
+        while True:
             self._emit_flow_status()
-            waiting = self.ser.in_waiting
-            if not waiting:
+            acknowledged = self._read_waiting_input() or acknowledged
+            if time.time() >= deadline:
+                break
+            if not self.ser.in_waiting:
                 time.sleep(0.01)
-                continue
 
-            self._rx_buffer += self.ser.read(waiting).decode("ascii", errors="replace")
-            parts = re.split(r"[\r\n]+", self._rx_buffer)
-            if self._rx_buffer.endswith(("\r", "\n")):
-                complete_lines = parts
-                self._rx_buffer = ""
-            else:
-                complete_lines = parts[:-1]
-                self._rx_buffer = parts[-1]
+        return self._finish_short_response_fragment() or acknowledged
 
-            for line in complete_lines:
-                acknowledged = self._handle_received_line(line) or acknowledged
-
-        if self._rx_buffer.strip() == "C":
-            acknowledged = self._handle_received_line(self._rx_buffer) or acknowledged
-            self._rx_buffer = ""
-        elif self._rx_buffer.strip() == "Z":
-            self._handle_received_line(self._rx_buffer)
-            self._rx_buffer = ""
-
-        return acknowledged
-
-    def _read_available(self):
+    def _read_available(self, wait_s: float = 0.0):
         try:
-            self._read_lines_until(time.time() + 0.25)
+            self._read_lines_until(time.time() + wait_s)
             self._emit_flow_status()
         except Exception as exc:
             self.error.emit(f"Read error: {exc}")
@@ -439,6 +454,9 @@ class SerialWorker(QObject):
         echo_enabled = False
         completed = False
         stopped_by_user = False
+        stream_result: str | None = None
+        stream_error: str | None = None
+        cleanup_error: str | None = None
 
         try:
             if any(self._normalize_command(command).upper() == "IN;" for command in commands):
@@ -489,12 +507,17 @@ class SerialWorker(QObject):
                 self.streaming_progress.emit(index, total)
 
             if stopped_by_user:
-                self.streaming_stopped.emit()
+                stream_result = "stopped"
             else:
                 completed = True
-                self.streaming_finished.emit()
+                stream_result = "finished"
         except Exception as exc:
-            self.error.emit(f"Streaming error: {exc}")
+            if str(exc) == "Streaming interrupted by user.":
+                self.log.emit("Streaming interrupted by user.")
+                stopped_by_user = True
+                stream_result = "stopped"
+            else:
+                stream_error = f"Streaming error: {exc}"
         finally:
             if use_echo_ack and echo_enabled and completed and self.ser and self.ser.is_open:
                 try:
@@ -502,7 +525,7 @@ class SerialWorker(QObject):
                     self._write_command("!CT0;")
                     self._read_lines_until(time.time() + 0.5)
                 except Exception as exc:
-                    self.error.emit(f"Could not disable echo mode: {exc}")
+                    cleanup_error = f"Could not disable echo mode: {exc}"
             elif use_echo_ack and echo_enabled:
                 self.log.emit(
                     "Echo acknowledgement mode may still be enabled; recover manually before streaming again."
@@ -510,6 +533,15 @@ class SerialWorker(QObject):
             self._streaming = False
             self._stop_streaming = False
             self._emit_flow_status(force=True)
+
+        if stream_error is not None:
+            self.error.emit(stream_error)
+        elif cleanup_error is not None:
+            self.error.emit(cleanup_error)
+        elif stream_result == "stopped":
+            self.streaming_stopped.emit()
+        elif stream_result == "finished":
+            self.streaming_finished.emit()
 
     @Slot()
     def request_stop_streaming(self):
@@ -545,6 +577,7 @@ class MainWindow(QMainWindow):
     read_requested = Signal()
     stream_requested = Signal(list, bool, str)
     stop_stream_requested = Signal()
+    POLL_INTERVAL_MS = 1000
 
     def __init__(self):
         super().__init__()
@@ -601,8 +634,22 @@ class MainWindow(QMainWindow):
         self.show_loaded_limits()
 
         self.poll_timer = QTimer(self)
-        self.poll_timer.timeout.connect(lambda: self.read_requested.emit())
-        self.poll_timer.start(1000)
+        self.poll_timer.timeout.connect(self.poll_serial)
+        self.poll_timer.start(self.POLL_INTERVAL_MS)
+
+    def poll_serial(self) -> None:
+        if self.streaming_active:
+            return
+        self.read_requested.emit()
+
+    def set_streaming_active(self, active: bool) -> None:
+        self.streaming_active = active
+        if hasattr(self, "poll_timer"):
+            if active:
+                self.poll_timer.stop()
+            elif not self.poll_timer.isActive():
+                self.poll_timer.start(self.POLL_INTERVAL_MS)
+        self.refresh_top_actions()
 
     def _build_menu(self):
         file_menu = self.menuBar().addMenu("File")
@@ -1064,8 +1111,7 @@ class MainWindow(QMainWindow):
 
     def on_worker_error(self, text: str):
         if self.streaming_active:
-            self.streaming_active = False
-            self.refresh_top_actions()
+            self.set_streaming_active(False)
         self.show_error(text)
 
     def set_indicator(self, label: QLabel, name: str, active: bool) -> None:
@@ -1122,14 +1168,12 @@ class MainWindow(QMainWindow):
         self.progress_label.setText(f"File: {index}/{total} commands")
 
     def on_stream_finished(self) -> None:
-        self.streaming_active = False
-        self.refresh_top_actions()
+        self.set_streaming_active(False)
         self.append_log("Streaming finished.")
         self.statusBar().showMessage("Streaming finished", 5000)
 
     def on_stream_stopped(self) -> None:
-        self.streaming_active = False
-        self.refresh_top_actions()
+        self.set_streaming_active(False)
         self.append_log("Streaming stopped by user. Confirm machine state before recovery.")
         self.statusBar().showMessage("Streaming stopped", 5000)
 
@@ -1270,8 +1314,7 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
 
-        self.streaming_active = True
-        self.refresh_top_actions()
+        self.set_streaming_active(True)
         self.stream_requested.emit(
             self.hpgl_commands,
             self.echo_ack_streaming.isChecked(),
