@@ -1068,23 +1068,17 @@ class MainWindow(QMainWindow):
         flow_status = QHBoxLayout()
         self.cts_indicator = QLabel("CTS: —")
         self.rts_indicator = QLabel("RTS: —")
-        self.send_allowed_indicator = QLabel("Send: —")
         for indicator in (
             self.cts_indicator,
             self.rts_indicator,
-            self.send_allowed_indicator,
         ):
             indicator.setMinimumWidth(95)
             indicator.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.cts_indicator.setToolTip("Actual Clear To Send state read from pySerial.")
         self.rts_indicator.setToolTip("RTS state reported by pySerial.")
-        self.send_allowed_indicator.setToolTip(
-            "Streaming may write only when the port is open, CTS is active, and no previous bytes remain queued."
-        )
         flow_status.addWidget(QLabel("Serial flow"))
         flow_status.addWidget(self.cts_indicator)
         flow_status.addWidget(self.rts_indicator)
-        flow_status.addWidget(self.send_allowed_indicator)
         flow_status.addStretch(1)
         self.update_flow_status(False, False, False)
 
@@ -1309,7 +1303,6 @@ class MainWindow(QMainWindow):
     def update_flow_status(self, cts: bool, rts: bool, send_allowed: bool) -> None:
         self.set_indicator(self.cts_indicator, "CTS", cts)
         self.set_indicator(self.rts_indicator, "RTS", rts)
-        self.set_indicator(self.send_allowed_indicator, "Send", send_allowed)
 
     def update_position(self, x: float, y: float, z: float):
         self.x_label.setText(f"X: {x:g}")
